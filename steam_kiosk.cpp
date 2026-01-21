@@ -968,6 +968,10 @@ inline void update_ui() {
     debug_log(L"VERBOSE: kiosk_shell_status() returned: %d, setting checkbox to: %d", shell_status, shell_checked);
     SendMessageW(g_hwnd_shell, BM_SETCHECK, shell_checked, 0);
     
+    BOOL users_prompt_checked = users_prompt_status() ? BST_CHECKED : BST_UNCHECKED;
+    debug_log(L"VERBOSE: users_prompt_status() returned: %d, setting checkbox to: %d", users_prompt_status(), users_prompt_checked);
+    SendMessageW(g_hwnd_users_prompt, BM_SETCHECK, users_prompt_checked, 0);
+    
     debug_log(L"VERBOSE: update_ui() complete");
 }
 
