@@ -22,7 +22,8 @@ inline constexpr auto STEAM_KIOSK_PASS  = L"valve";
 inline constexpr auto STEAM_KIOSK_HIVE  = L"C:\\Users\\steam_kiosk\\NTUSER.DAT";
 
 inline constexpr int MAIN_WINDOW_WIDTH  = 400;
-inline constexpr int MAIN_WINDOW_HEIGHT = 200;
+inline constexpr int MAIN_WINDOW_HEIGHT = 300;
+inline constexpr int TOGGLE_WIDTH       = 112; // ((400−(20×2))−(12×2))×1/3
 inline constexpr int BUTTON_WIDTH       = 150;
 inline constexpr int BUTTON_HEIGHT      = 40;
 inline constexpr int FONT_SIZE          = 16;
@@ -33,8 +34,10 @@ inline constexpr int FONT_SIZE          = 16;
 HWND h_title;
 HWND h_autologin;
 HWND h_shell;
+HWND h_users_prompt;
 HWND h_logoff;
 HWND h_restart;
+HWND h_delete_user;
 
 // ========================================
 // Forward declarations
@@ -43,6 +46,65 @@ void update_ui();
 void prompt_first_login();
 void switch_to_other_user_screen();
 void kiosk_setup_if_needed();
+
+struct scoped_privileges {
+    HANDLE token = nullptr;
+    TOKEN_PRIVILEGES old_tp{};
+    DWORD old_tp_size = sizeof(old_tp);
+
+    explicit scoped_privileges(std::initializer_list<LPCWSTR> privs) {
+        if (!OpenProcessToken(GetCurrentProcess(),
+                              TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                              &token))
+            return;
+
+        for (auto p : privs) {
+            LUID luid;
+            if (!LookupPrivilegeValueW(nullptr, p, &luid))
+                continue;
+
+            TOKEN_PRIVILEGES tp{};
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Luid = luid;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+            AdjustTokenPrivileges(token, FALSE, &tp,
+                                   sizeof(old_tp), &old_tp, &old_tp_size);
+        }
+    }
+
+    ~scoped_privileges() {
+        if (token) {
+            AdjustTokenPrivileges(token, FALSE, &old_tp, 0, nullptr, nullptr);
+            CloseHandle(token);
+        }
+    }
+};
+
+struct scoped_user_hive {
+    const wchar_t* hive_name = L"STEAM_KIOSK";
+    wchar_t temp_hive[MAX_PATH]{};
+    bool loaded = false;
+
+    scoped_user_hive() {
+        swprintf_s(temp_hive, L"C:\\tools\\steam_shell\\NTUSER_TEMP.DAT");
+
+        if (!CopyFileW(STEAM_KIOSK_HIVE, temp_hive, FALSE))
+            return;
+
+        if (RegLoadKeyW(HKEY_USERS, hive_name, temp_hive) == ERROR_SUCCESS)
+            loaded = true;
+    }
+
+    ~scoped_user_hive() {
+        if (loaded) {
+            RegUnLoadKeyW(HKEY_USERS, hive_name);
+            DeleteFileW(temp_hive);
+        }
+    }
+
+    bool ok() const { return loaded; }
+};
 
 // ========================================
 // Privileges
@@ -113,7 +175,7 @@ inline void kiosk_user_destroy()
 inline int kiosk_profile_exists() {
     const wchar_t* hive_name = L"STEAM_KIOSK";
     wchar_t user_hive[MAX_PATH]{};
-    swprintf_s(user_hive, STEAM_KIOSK_HIVE);
+    wcscpy_s(user_hive, STEAM_KIOSK_HIVE);
 
     if (GetFileAttributesW(user_hive) == INVALID_FILE_ATTRIBUTES)  
         return 1;
@@ -200,140 +262,139 @@ inline bool autologin_status()
 // ========================================
 // Other Users Prompt
 // ========================================
-inline void users_prompt_enable()
+bool _users_prompt(bool enable)
 {
     HKEY h_key;
-    DWORD one = 1;
+    DWORD value = enable ? 1 : 0;
 
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-                      0, KEY_SET_VALUE, &h_key) == ERROR_SUCCESS)
-    {
-        RegSetValueExW(h_key, L"dontdisplaylastusername", 0, REG_DWORD,
-                       (const BYTE*)&one, sizeof(one));
-        RegFlushKey(h_key);
-        RegCloseKey(h_key);
-    }
+    if (RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+            0,
+            KEY_SET_VALUE,
+            &h_key) != ERROR_SUCCESS)
+        return false;
+
+    LONG rc = RegSetValueExW(
+        h_key,
+        L"dontdisplaylastusername",
+        0,
+        REG_DWORD,
+        reinterpret_cast<const BYTE*>(&value),
+        sizeof(value));
+
+    RegFlushKey(h_key);
+    RegCloseKey(h_key);
+
+    return rc == ERROR_SUCCESS;
+}
+
+inline bool users_prompt_status()
+{
+    HKEY h_key;
+    DWORD value = 0;
+    DWORD size  = sizeof(value);
+    DWORD type  = 0;
+
+    if (RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+            0,
+            KEY_QUERY_VALUE,
+            &h_key) != ERROR_SUCCESS)
+        return false;
+
+    LONG rc = RegQueryValueExW(
+        h_key,
+        L"dontdisplaylastusername",
+        nullptr,
+        &type,
+        reinterpret_cast<BYTE*>(&value),
+        &size);
+
+    RegCloseKey(h_key);
+
+    return rc == ERROR_SUCCESS &&
+           type == REG_DWORD &&
+           value == 1;
+}
+
+inline void users_prompt_enable()
+{
+    _users_prompt(true);
 }
 
 inline void users_prompt_disable()
 {
-    HKEY h_key;
-    DWORD zero = 0;
-
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-                      0, KEY_SET_VALUE, &h_key) == ERROR_SUCCESS)
-    {
-        RegSetValueExW(h_key, L"dontdisplaylastusername", 0, REG_DWORD,
-                       (const BYTE*)&zero, sizeof(zero));
-        RegFlushKey(h_key);
-        RegCloseKey(h_key);
-    }
+    _users_prompt(false);
 }
 
 // ========================================
 // Kiosk Shell
 // ========================================
+inline bool kiosk_set_shell(LPCWSTR shell_cmd)
+{
+    scoped_privileges privs{ SE_BACKUP_NAME, SE_RESTORE_NAME };
+    scoped_user_hive hive;
+
+    if (!hive.ok())
+        return false;
+
+    HKEY key;
+    LONG rc = RegOpenKeyExW(
+        HKEY_USERS,
+        L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+        0, KEY_SET_VALUE, &key);
+
+    if (rc != ERROR_SUCCESS)
+        return false;
+
+    RegSetValueExW(key, L"Shell", 0, REG_SZ,
+        reinterpret_cast<const BYTE*>(shell_cmd),
+        static_cast<DWORD>((wcslen(shell_cmd) + 1) * sizeof(wchar_t)));
+
+    RegFlushKey(key);
+    RegCloseKey(key);
+    return true;
+}
 inline void kiosk_shell_bigpicture()
 {
-    /*! DUPLICATE !*/
-    HANDLE h_token;
-    if (OpenProcessToken(GetCurrentProcess(),
-                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                         &h_token))
-    {
-        system_privilege_enable(h_token, SE_RESTORE_NAME, TRUE);
-        system_privilege_enable(h_token, SE_BACKUP_NAME, TRUE);
-        CloseHandle(h_token);
-    }
-
-    const wchar_t* hive_name = L"STEAM_KIOSK";
-    wchar_t user_hive[MAX_PATH]{};
-    swprintf_s(user_hive, STEAM_KIOSK_HIVE);
-
-    if (RegLoadKeyW(HKEY_USERS, hive_name, user_hive) != ERROR_SUCCESS)
-        return;
-
-    HKEY h_key;
-    if (RegOpenKeyExW(HKEY_USERS,
-                      L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
-                      0, KEY_SET_VALUE, &h_key) == ERROR_SUCCESS)
-    {
-        RegSetValueExW(h_key, L"Shell", 0, REG_SZ,
-                       reinterpret_cast<const BYTE*>(BIG_PICTURE_EXEC),
-                       static_cast<DWORD>((wcslen(BIG_PICTURE_EXEC) + 1) * sizeof(wchar_t)));
-        RegFlushKey(h_key);
-        RegCloseKey(h_key);
-    }
-
-    RegUnLoadKeyW(HKEY_USERS, hive_name);
+    kiosk_set_shell(BIG_PICTURE_EXEC);
 }
 
 inline void kiosk_shell_explorer()
 {
-    HANDLE h_token;
-    if (OpenProcessToken(GetCurrentProcess(),
-                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                         &h_token))
-    {
-        system_privilege_enable(h_token, SE_RESTORE_NAME, TRUE);
-        system_privilege_enable(h_token, SE_BACKUP_NAME, TRUE);
-        CloseHandle(h_token);
-    }
-
-    const wchar_t* hive_name = L"STEAM_KIOSK";
-    wchar_t user_hive[MAX_PATH]{};
-    swprintf_s(user_hive, STEAM_KIOSK_HIVE);
-
-    if (RegLoadKeyW(HKEY_USERS, hive_name, user_hive) != ERROR_SUCCESS)
-        return;
-
-    HKEY h_key;
-    if (RegOpenKeyExW(HKEY_USERS,
-                      L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
-                      0, KEY_SET_VALUE, &h_key) == ERROR_SUCCESS)
-    {
-        const wchar_t* shell = L"explorer.exe";
-        RegSetValueExW(h_key, L"Shell", 0, REG_SZ,
-                       reinterpret_cast<const BYTE*>(shell),
-                       static_cast<DWORD>((wcslen(shell) + 1) * sizeof(wchar_t)));
-        RegFlushKey(h_key);
-        RegCloseKey(h_key);
-    }
-
-    RegUnLoadKeyW(HKEY_USERS, hive_name);
+    kiosk_set_shell(L"explorer.exe");
 }
 
 inline bool kiosk_shell_status()
 {
-    const wchar_t* hive_name = L"STEAM_KIOSK";
-    wchar_t user_hive[MAX_PATH]{};
-    swprintf_s(user_hive, STEAM_KIOSK_HIVE);
+    scoped_privileges privs{ SE_BACKUP_NAME };
+    scoped_user_hive hive;
 
-    if (RegLoadKeyW(HKEY_USERS, hive_name, user_hive) != ERROR_SUCCESS)
+    if (!hive.ok())
         return false;
 
     wchar_t shell[512]{};
     DWORD size = sizeof(shell);
 
-    LONG ret = RegGetValueW(HKEY_USERS,
-                            L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
-                            L"Shell", RRF_RT_REG_SZ, nullptr,
-                            shell, &size);
+    LONG rc = RegGetValueW(
+        HKEY_USERS,
+        L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+        L"Shell",
+        RRF_RT_REG_SZ, nullptr, shell, &size);
 
-    bool result = (ret == ERROR_SUCCESS) &&
-                  (wcscmp(shell, BIG_PICTURE_EXEC) == 0);
-
-    RegUnLoadKeyW(HKEY_USERS, hive_name);
-    return result;
+    return rc == ERROR_SUCCESS && wcscmp(shell, BIG_PICTURE_EXEC) == 0;
 }
 
 // ========================================
 // Session helpers
 // ========================================
-inline void logoff_user()  { ExitWindowsEx(EWX_LOGOFF | EWX_FORCE, 0); }
-inline void restart_user() { ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0); }
+inline void logoff_user()  {
+    ExitWindowsEx(EWX_LOGOFF | EWX_FORCE, 0);
+}
+
+inline void     restart_user() { ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0); }
 
 // ========================================
 // UI Helpers
@@ -349,11 +410,12 @@ inline void update_ui()
 inline void prompt_first_login()
 {
     wchar_t msg[512];
-    swprintf_s(msg, L"Steam Kiosk user created.\n\n"
-                    L"Please log in once using username: %s\n"
-                    L"Password: %s\n\n"
-                    L"After logging into the kiosk user, wait for initialisation then log out.\n"
-                    L"Then log back into your personal user account and return to this helper.",
+    swprintf_s(msg, L"Kiosk user created:\n\n"
+                    L"Username: `%s`\n"
+                    L"Password: `%s`\n\n"
+                    L"After closing this message box, the login screen will appear.\n"
+                    L"Login using the details provided above and wait for initialisation to completex`.\n"
+                    L"Then logout, and log back into your personal user account to return to this helper.",
             STEAM_KIOSK_USER, STEAM_KIOSK_PASS);
 
     MessageBoxW(nullptr, msg, L"Steam Kiosk Setup", MB_OK | MB_ICONINFORMATION);
@@ -392,10 +454,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             autologin_status() ? autologin_disable() : autologin_enable();
         else if ((HWND)lParam == h_shell)
             kiosk_shell_status() ? kiosk_shell_explorer() : kiosk_shell_bigpicture();
+        else if ((HWND)lParam == h_users_prompt)
+            users_prompt_status() ? users_prompt_disable() : users_prompt_enable();
         else if ((HWND)lParam == h_logoff)
             logoff_user();
         else if ((HWND)lParam == h_restart)
             restart_user();
+        else if ((HWND)lParam == h_delete_user)
+        {
+            if (MessageBoxW(hwnd, L"Are you sure you want to delete the Steam Kiosk user?",
+                            L"Confirm Delete", MB_YESNO | MB_ICONWARNING) == IDYES)
+            {
+                kiosk_user_destroy();
+                MessageBoxW(hwnd, L"Steam Kiosk user deleted.\nPlease delete its folder", L"Deleted", MB_OK | MB_ICONINFORMATION);
+                update_ui();
+            }
+        }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         update_ui();
@@ -469,14 +543,21 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     SendMessageW(h_title, WM_SETFONT, (WPARAM)h_font, TRUE);
 
     // Buttons / Checkboxes 2x2 grid
+    // 20+112+12+112+12+112+20 
+    // ((400−(20×2))−(12×2))×1/3
     h_autologin = CreateWindowW(L"BUTTON", L"Autologin",
                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                50, 60, BUTTON_WIDTH, BUTTON_HEIGHT,
+                                20, 60, TOGGLE_WIDTH, BUTTON_HEIGHT,
                                 hwnd, nullptr, hInst, nullptr);
 
     h_shell = CreateWindowW(L"BUTTON", L"Big-Picture Shell",
                              WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                             220, 60, BUTTON_WIDTH, BUTTON_HEIGHT,
+                             144, 60, TOGGLE_WIDTH, BUTTON_HEIGHT,
+                             hwnd, nullptr, hInst, nullptr);
+
+    h_users_prompt = CreateWindowW(L"BUTTON", L"User Prompt",
+                             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                             268, 60, TOGGLE_WIDTH, BUTTON_HEIGHT,
                              hwnd, nullptr, hInst, nullptr);
 
     h_logoff = CreateWindowW(L"BUTTON", L"Log Off",
@@ -488,11 +569,20 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                220, 120, BUTTON_WIDTH, BUTTON_HEIGHT,
                                hwnd, nullptr, hInst, nullptr);
+                               // Delete User button (bottom middle)
+    h_delete_user = CreateWindowW(L"BUTTON", L"Delete User",
+                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                              (MAIN_WINDOW_WIDTH - BUTTON_WIDTH) / 2, // center horizontally
+                              180, // below the 2x2 grid (adjust spacing)
+                              BUTTON_WIDTH, BUTTON_HEIGHT,
+                              hwnd, nullptr, hInst, nullptr);
 
     SendMessageW(h_autologin, WM_SETFONT, (WPARAM)h_font, TRUE);
     SendMessageW(h_shell, WM_SETFONT, (WPARAM)h_font, TRUE);
+    SendMessageW(h_users_prompt, WM_SETFONT, (WPARAM)h_font, TRUE);
     SendMessageW(h_logoff, WM_SETFONT, (WPARAM)h_font, TRUE);
     SendMessageW(h_restart, WM_SETFONT, (WPARAM)h_font, TRUE);
+    SendMessageW(h_delete_user, WM_SETFONT, (WPARAM)h_font, TRUE);
 
     ShowWindow(hwnd, SW_SHOW);
     update_ui();
