@@ -126,7 +126,25 @@ struct scoped_privileges {
     }
 };
 
+// ========================================
+// User Detection
+// ========================================
+inline bool is_running_as_steam_kiosk() {
+    wchar_t username[256]{};
+    DWORD username_len = sizeof(username) / sizeof(username[0]);
+    
+    if (!GetUserNameW(username, &username_len)) {
+        debug_log(L"WARNING: Failed to get current username. LastError: %lu", GetLastError());
+        return false;
+    }
+    
+    bool is_kiosk = (wcscmp(username, STEAM_KIOSK_USER) == 0);
+    debug_log(L"INFO: Current user detected: %s (Is steam_kiosk: %d)", username, is_kiosk ? 1 : 0);
+    return is_kiosk;
+}
+
 struct scoped_user_hive {
+
     const wchar_t* hive_name = L"STEAM_KIOSK";
     wchar_t temp_hive[MAX_PATH]{};
     bool loaded = false;
