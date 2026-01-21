@@ -109,15 +109,16 @@ inline void kiosk_user_destroy()
 // ========================================
 // Kiosk Profile
 // ========================================
-inline bool kiosk_profile_exists()
-{
+inline int kiosk_profile_exists() {
     const wchar_t* hive_name = L"STEAM_KIOSK";
     wchar_t user_hive[MAX_PATH]{};
     swprintf_s(user_hive, L"C:\\Users\\%s\\NTUSER.DAT", STEAM_KIOSK_USER);
 
+    if (GetFileAttributesW(user_hive) == INVALID_FILE_ATTRIBUTES)  
+        return 1;
     if (RegLoadKeyW(HKEY_USERS, hive_name, user_hive) != ERROR_SUCCESS)
-        return false;
-    return true;
+        return 3;
+    return 0;
 }
 
 // ========================================
@@ -356,6 +357,15 @@ inline void prompt_first_login()
     MessageBoxW(nullptr, msg, L"Steam Kiosk Setup", MB_OK | MB_ICONINFORMATION);
 }
 
+inline void prompt_corrupt_profile()
+{
+    wchar_t msg[64];
+    swprintf_s(msg, L"NTUSER.DAT for `%s` is corrupted and unreadable!\n\n",
+                    L"The program will attempt to recreate the user profile on next run.",
+        STEAM_KIOSK_USER);
+    MessageBoxW(nullptr, msg, L"Steam Kiosk Setup", MB_OK | MB_ICONERROR);
+}
+
 inline void switch_to_other_user_screen()
 {
     autologin_disable();
@@ -402,14 +412,22 @@ void kiosk_setup_if_needed()
             ExitProcess(1);
         }
     }
-    if (!kiosk_profile_exists()) {
-        prompt_first_login();
-        users_prompt_enable();
-        switch_to_other_user_screen();
-        users_prompt_disable();
+
+    
+    int profile_status = kiosk_profile_exists();
+    if (profile_status != 0) {
+        if (profile_status == 1) {
+            // First login needed
+            prompt_first_login();
+            // users_prompt_enable();
+            // switch_to_other_user_screen();
+            // users_prompt_disable();
+        } else if (profile_status == 3) {
+            prompt_corrupt_profile();
+            ExitProcess(1);
+        }
+
         ExitProcess(0);
-    } else {
-        users_prompt_disable();
     }
 }
 
