@@ -591,6 +591,9 @@ inline bool system_privilege_enable(HANDLE h_token, LPCWSTR privilege, BOOL enab
 // User Management
 // ========================================
 inline bool kiosk_user_exists() {
+    if (is_running_as_steam_kiosk()) {
+        return true;
+    }
     USER_INFO_0* buf = nullptr;
     DWORD entries_read, total_entries;
     auto res = NetUserEnum(nullptr, 0, FILTER_NORMAL_ACCOUNT,
