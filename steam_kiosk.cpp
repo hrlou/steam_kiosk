@@ -111,9 +111,13 @@ inline void kiosk_user_destroy()
 // ========================================
 inline bool kiosk_profile_exists()
 {
-    wchar_t path[MAX_PATH];
-    swprintf_s(path, L"C:\\Users\\%s\\NTUSER.DAT", STEAM_KIOSK_USER);
-    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+    const wchar_t* hive_name = L"STEAM_KIOSK";
+    wchar_t user_hive[MAX_PATH]{};
+    swprintf_s(user_hive, L"C:\\Users\\%s\\NTUSER.DAT", STEAM_KIOSK_USER);
+
+    if (RegLoadKeyW(HKEY_USERS, hive_name, user_hive) != ERROR_SUCCESS)
+        return false;
+    return true;
 }
 
 // ========================================
@@ -231,6 +235,7 @@ inline void users_prompt_disable()
 // ========================================
 inline void kiosk_shell_bigpicture()
 {
+    /*! DUPLICATE !*/
     HANDLE h_token;
     if (OpenProcessToken(GetCurrentProcess(),
                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
@@ -265,6 +270,16 @@ inline void kiosk_shell_bigpicture()
 
 inline void kiosk_shell_explorer()
 {
+    HANDLE h_token;
+    if (OpenProcessToken(GetCurrentProcess(),
+                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                         &h_token))
+    {
+        system_privilege_enable(h_token, SE_RESTORE_NAME, TRUE);
+        system_privilege_enable(h_token, SE_BACKUP_NAME, TRUE);
+        CloseHandle(h_token);
+    }
+
     const wchar_t* hive_name = L"STEAM_KIOSK";
     wchar_t user_hive[MAX_PATH]{};
     swprintf_s(user_hive, L"C:\\Users\\%s\\NTUSER.DAT", STEAM_KIOSK_USER);
