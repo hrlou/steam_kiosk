@@ -653,6 +653,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 if (destroy_kiosk_user_completely()) {
                     MessageBoxW(hwnd, L"Steam Kiosk user and profile deleted successfully.",
                                 L"Deleted", MB_OK | MB_ICONINFORMATION);
+                    ExitProcess(0);
                 } else {
                     MessageBoxW(hwnd, L"Failed to delete Steam Kiosk user and/or profile.",
                                 L"Error", MB_OK | MB_ICONERROR);
@@ -697,7 +698,14 @@ void kiosk_setup_if_needed()
         MessageBoxW(nullptr, L"Please press OK to continue.\n",
                              L"And to proceed to backuping up the profile",
                              MB_OK | MB_ICONINFORMATION);
-        ntuserdat_backup();
+        Sleep(1000);
+        if (ntuserdat_backup()) {
+            MessageBoxW(nullptr, L"Profile backup created successfully.",
+                                 L"Backup Created", MB_OK | MB_ICONINFORMATION);
+        } else {
+            MessageBoxW(nullptr, L"Failed to create profile backup.",
+                                 L"Backup Failed", MB_OK | MB_ICONERROR);
+        }
     } else if (profile_status == 3) {
         if (prompt_corrupt_profile()) {
             // kiosk_user_destroy();
