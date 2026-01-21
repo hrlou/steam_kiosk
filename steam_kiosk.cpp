@@ -45,6 +45,9 @@ HWND g_hwnd_logoff;
 HWND g_hwnd_restart;
 HWND g_hwnd_delete_user;
 
+// Single instance mutex - prevents multiple launches
+HANDLE g_single_instance_mutex = nullptr;
+
 // ========================================
 // Forward declarations
 // ========================================
@@ -231,6 +234,16 @@ struct scoped_user_hive {
         if (loaded) {
             debug_log(L"INFO: Unloading hive from registry");
             RegUnLoadKeyW(HKEY_USERS, hive_name);
+            
+            // CRITICAL: Copy the modified temp hive back to the original NTUSER.DAT
+            // so changes persist between application runs
+            if (!CopyFileW(temp_hive, STEAM_KIOSK_HIVE, FALSE)) {
+                debug_log(L"ERROR: Failed to copy modified hive back to NTUSER.DAT. LastError: %lu", 
+                          GetLastError());
+            } else {
+                debug_log(L"INFO: Modified hive successfully copied back to NTUSER.DAT");
+            }
+            
             if (!DeleteFileW(temp_hive)) {
                 debug_log(L"WARNING: Failed to delete temporary hive file: %s", temp_hive);
             } else {
@@ -248,16 +261,22 @@ struct scoped_user_hive {
 // Misc Helpers
 // ========================================
 
-inline bool delete_directory_recursive(const wchar_t* path)
-{
+inline bool delete_directory_recursive(const wchar_t* path) {
     wchar_t search_path[MAX_PATH];
     swprintf_s(search_path, L"%s\\*", path);
 
     WIN32_FIND_DATAW fd;
     HANDLE h_find = FindFirstFileW(search_path, &fd);
 
-    if (h_find == INVALID_HANDLE_VALUE)
+    if (h_find == INVALID_HANDLE_VALUE) {
+        debug_log(L"WARNING: Could not find files in directory: %s. LastError: %lu", 
+                  path, GetLastError());
         return false;
+    }
+
+    int deleted_files = 0;
+    int deleted_dirs = 0;
+    int failed_items = 0;
 
     do {
         if (wcscmp(fd.cFileName, L".") == 0 ||
@@ -272,77 +291,157 @@ inline bool delete_directory_recursive(const wchar_t* path)
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (!delete_directory_recursive(full_path)) {
-                FindClose(h_find);
-                return false;
+                failed_items++;
+                debug_log(L"WARNING: Failed to delete subdirectory: %s", full_path);
+            } else {
+                deleted_dirs++;
             }
         } else {
             if (!DeleteFileW(full_path)) {
-                FindClose(h_find);
-                return false;
+                failed_items++;
+                debug_log(L"WARNING: Failed to delete file: %s. LastError: %lu", 
+                          full_path, GetLastError());
+            } else {
+                deleted_files++;
             }
         }
     } while (FindNextFileW(h_find, &fd));
 
     FindClose(h_find);
 
+    debug_log(L"INFO: Directory cleanup stats - Deleted files: %d, Deleted dirs: %d, Failed: %d",
+              deleted_files, deleted_dirs, failed_items);
+
     // Finally remove the now-empty directory
     SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
-    return RemoveDirectoryW(path) != FALSE;
-}
-
-inline bool terminate_processes_for_user(const wchar_t* username)
-{
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE)
-        return false;
-
-    PROCESSENTRY32W pe{};
-    pe.dwSize = sizeof(pe);
-
-    if (!Process32FirstW(snap, &pe)) {
-        CloseHandle(snap);
+    if (!RemoveDirectoryW(path)) {
+        debug_log(L"WARNING: Failed to remove directory: %s. LastError: %lu",
+                  path, GetLastError());
         return false;
     }
 
-    do {
-        HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
-                                  PROCESS_TERMINATE,
-                                  FALSE, pe.th32ProcessID);
-        if (!proc)
+    return true;
+}
+
+inline bool terminate_processes_for_user(const wchar_t* username) {
+    debug_log(L"INFO: Terminating all processes for user: %s", username);
+
+    int terminated_count = 0;
+    int attempts = 0;
+    const int MAX_ATTEMPTS = 3;
+
+    // Multiple passes to ensure all processes are killed
+    while (attempts < MAX_ATTEMPTS) {
+        attempts++;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) {
+            debug_log(L"WARNING: Failed to create process snapshot (attempt %d/%d)", attempts, MAX_ATTEMPTS);
+            Sleep(100);
             continue;
+        }
 
-        HANDLE token;
-        if (OpenProcessToken(proc, TOKEN_QUERY, &token)) {
-            DWORD size = 0;
-            GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
 
-            if (size) {
-                BYTE buf[512];
-                if (size <= sizeof(buf) &&
-                    GetTokenInformation(token, TokenUser, buf, size, &size))
-                {
-                    TOKEN_USER* tu = reinterpret_cast<TOKEN_USER*>(buf);
+        if (!Process32FirstW(snap, &pe)) {
+            CloseHandle(snap);
+            debug_log(L"WARNING: Failed to get first process (attempt %d/%d)", attempts, MAX_ATTEMPTS);
+            Sleep(100);
+            continue;
+        }
 
-                    wchar_t name[128], domain[128];
-                    DWORD nlen = 128, dlen = 128;
-                    SID_NAME_USE use;
+        int pass_terminated = 0;
+        do {
+            HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                                      FALSE, pe.th32ProcessID);
+            if (!proc)
+                continue;
 
-                    if (LookupAccountSidW(nullptr, tu->User.Sid,
-                                           name, &nlen,
-                                           domain, &dlen, &use))
-                    {
-                        if (_wcsicmp(name, username) == 0) {
-                            TerminateProcess(proc, 1);
+            HANDLE token;
+            if (OpenProcessToken(proc, TOKEN_QUERY, &token)) {
+                DWORD size = 0;
+                GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+
+                if (size) {
+                    BYTE buf[512];
+                    if (size <= sizeof(buf) &&
+                        GetTokenInformation(token, TokenUser, buf, size, &size)) {
+                        TOKEN_USER* tu = reinterpret_cast<TOKEN_USER*>(buf);
+
+                        wchar_t name[128], domain[128];
+                        DWORD nlen = 128, dlen = 128;
+                        SID_NAME_USE use;
+
+                        if (LookupAccountSidW(nullptr, tu->User.Sid, name, &nlen,
+                                              domain, &dlen, &use)) {
+                            if (_wcsicmp(name, username) == 0) {
+                                if (TerminateProcess(proc, 1)) {
+                                    pass_terminated++;
+                                    terminated_count++;
+                                    debug_log(L"INFO: Terminated process PID %lu", pe.th32ProcessID);
+                                }
+                            }
                         }
                     }
                 }
+                CloseHandle(token);
             }
-            CloseHandle(token);
-        }
-        CloseHandle(proc);
-    } while (Process32NextW(snap, &pe));
+            CloseHandle(proc);
+        } while (Process32NextW(snap, &pe));
 
-    CloseHandle(snap);
+        CloseHandle(snap);
+
+        if (pass_terminated == 0) {
+            debug_log(L"INFO: No more processes found for user (attempt %d/%d)", attempts, MAX_ATTEMPTS);
+            break;
+        }
+
+        debug_log(L"INFO: Pass %d: Terminated %d processes", attempts, pass_terminated);
+        Sleep(200);  // Give processes time to terminate
+    }
+
+    debug_log(L"SUCCESS: Process termination complete. Total terminated: %d", terminated_count);
+    return true;
+}
+
+// ========================================
+// User Account Disabling
+// ========================================
+inline bool disable_kiosk_user_account() {
+    debug_log(L"INFO: Disabling kiosk user account");
+
+    USER_INFO_3* pui = nullptr;
+    DWORD dw_error = 0;
+
+    // Retrieve current user info - NetUserGetInfo allocates the buffer
+    NET_API_STATUS status = NetUserGetInfo(nullptr, STEAM_KIOSK_USER, 3,
+                                           reinterpret_cast<LPBYTE*>(&pui));
+    if (status != NERR_Success) {
+        debug_log(L"ERROR: Failed to get user info. Status: %lu", status);
+        return false;
+    }
+
+    if (!pui) {
+        debug_log(L"ERROR: NetUserGetInfo returned null pointer");
+        return false;
+    }
+
+    // Set the disabled flag
+    pui->usri3_flags |= UF_ACCOUNTDISABLE;
+
+    // Update the user with disabled flag
+    status = NetUserSetInfo(nullptr, STEAM_KIOSK_USER, 3,
+                           reinterpret_cast<LPBYTE>(pui), &dw_error);
+
+    if (status != NERR_Success) {
+        debug_log(L"ERROR: Failed to disable user account. NetAPI Status: %lu, ParamError: %lu",
+                  status, dw_error);
+        NetApiBufferFree(pui);
+        return false;
+    }
+
+    NetApiBufferFree(pui);
+    debug_log(L"SUCCESS: User account disabled");
     return true;
 }
 
@@ -600,16 +699,41 @@ bool users_prompt_helper(bool enable) {
 
     HKEY h_key;
     DWORD value = enable ? 1 : 0;
+    DWORD disposition = 0;
 
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-                      0, KEY_SET_VALUE, &h_key) != ERROR_SUCCESS) {
-        debug_log(L"ERROR: Failed to open Policies registry key");
+    // Use RegCreateKeyExW to ensure path exists (needed if key doesn't exist yet)
+    LONG rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE,
+                              L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                              0, nullptr, REG_OPTION_NON_VOLATILE,
+                              KEY_SET_VALUE | KEY_QUERY_VALUE, nullptr, &h_key, &disposition);
+
+    if (rc != ERROR_SUCCESS) {
+        debug_log(L"ERROR: Failed to create/open Policies registry key. Status: %lu", rc);
         return false;
     }
 
-    LONG rc = RegSetValueExW(h_key, L"dontdisplaylastusername", 0, REG_DWORD,
-                             reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    debug_log(L"VERBOSE: Users prompt registry path %s (disposition: %lu)",
+              (disposition == REG_CREATED_NEW_KEY) ? L"CREATED" : L"OPENED", disposition);
+
+    rc = RegSetValueExW(h_key, L"dontdisplaylastusername", 0, REG_DWORD,
+                        reinterpret_cast<const BYTE*>(&value), sizeof(value));
+
+    debug_log(L"VERBOSE: RegSetValueExW returned status: %lu", rc);
+
+    if (rc == ERROR_SUCCESS) {
+        // Verify the write by reading back
+        DWORD verify_value = 0;
+        DWORD verify_size = sizeof(verify_value);
+        DWORD verify_type = 0;
+
+        LONG verify_rc = RegQueryValueExW(h_key, L"dontdisplaylastusername", nullptr, &verify_type,
+                                          reinterpret_cast<BYTE*>(&verify_value), &verify_size);
+
+        if (verify_rc == ERROR_SUCCESS && verify_type == REG_DWORD) {
+            debug_log(L"VERBOSE: Users prompt value verified - Read back: %lu (expected: %lu)",
+                      verify_value, value);
+        }
+    }
 
     RegFlushKey(h_key);
     RegCloseKey(h_key);
@@ -629,24 +753,39 @@ inline bool users_prompt_status() {
     DWORD size = sizeof(value);
     DWORD type = 0;
 
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-                      0, KEY_QUERY_VALUE, &h_key) != ERROR_SUCCESS)
-        return false;
+    LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                            L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                            0, KEY_QUERY_VALUE, &h_key);
 
-    LONG rc = RegQueryValueExW(h_key, L"dontdisplaylastusername", nullptr, &type,
-                               reinterpret_cast<BYTE*>(&value), &size);
+    if (rc != ERROR_SUCCESS) {
+        debug_log(L"VERBOSE: Cannot open Policies registry key for status check. Status: %lu", rc);
+        return false;
+    }
+
+    rc = RegQueryValueExW(h_key, L"dontdisplaylastusername", nullptr, &type,
+                          reinterpret_cast<BYTE*>(&value), &size);
 
     RegCloseKey(h_key);
 
-    return rc == ERROR_SUCCESS && type == REG_DWORD && value == 1;
+    bool result = rc == ERROR_SUCCESS && type == REG_DWORD && value == 1;
+    
+    if (rc == ERROR_SUCCESS) {
+        debug_log(L"VERBOSE: Users prompt status query - Value: %lu, Type: %lu (REG_DWORD=%u), Result: %s",
+                  value, type, REG_DWORD, result ? L"TRUE" : L"FALSE");
+    } else {
+        debug_log(L"VERBOSE: Failed to query users prompt value. Status: %lu", rc);
+    }
+
+    return result;
 }
 
 inline void users_prompt_enable() {
+    debug_log(L"VERBOSE: User clicked Enable Users Prompt button");
     users_prompt_helper(true);
 }
 
 inline void users_prompt_disable() {
+    debug_log(L"VERBOSE: User clicked Disable Users Prompt button");
     users_prompt_helper(false);
 }
 
@@ -664,55 +803,141 @@ inline bool kiosk_set_shell(LPCWSTR shell_cmd) {
         return false;
     }
 
-    HKEY key;
-    LONG rc = RegOpenKeyExW(HKEY_USERS,
-                            L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
-                            0, KEY_SET_VALUE, &key);
+    // First, ensure the registry path exists - create it if needed
+    HKEY path_key;
+    LONG rc = RegCreateKeyExW(HKEY_USERS,
+                              L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+                              0, nullptr, REG_OPTION_NON_VOLATILE,
+                              KEY_SET_VALUE | KEY_QUERY_VALUE, nullptr, &path_key, nullptr);
 
     if (rc != ERROR_SUCCESS) {
-        debug_log(L"ERROR: Failed to open shell registry key. Status: %lu", rc);
+        debug_log(L"ERROR: Failed to create/open Winlogon path. Status: %lu", rc);
         return false;
     }
 
-    rc = RegSetValueExW(key, L"Shell", 0, REG_SZ,
-                        reinterpret_cast<const BYTE*>(shell_cmd),
-                        static_cast<DWORD>((wcslen(shell_cmd) + 1) * sizeof(wchar_t)));
+    debug_log(L"VERBOSE: Winlogon registry path created/opened successfully");
 
-    RegFlushKey(key);
-    RegCloseKey(key);
+    DWORD size = (DWORD)((wcslen(shell_cmd) + 1) * sizeof(wchar_t));
+    debug_log(L"VERBOSE: Writing shell value - Size: %lu bytes, Command length: %lu chars", 
+              size, wcslen(shell_cmd));
 
-    if (rc == ERROR_SUCCESS) {
-        debug_log(L"SUCCESS: Shell set successfully");
-    } else {
-        debug_log(L"ERROR: Failed to set shell. Status: %lu", rc);
+    rc = RegSetValueExW(path_key, L"Shell", 0, REG_SZ,
+                        reinterpret_cast<const BYTE*>(shell_cmd), size);
+
+    debug_log(L"VERBOSE: RegSetValueExW returned status: %lu", rc);
+
+    if (rc != ERROR_SUCCESS) {
+        debug_log(L"ERROR: Failed to set shell value in registry. Status: %lu", rc);
+        RegCloseKey(path_key);
+        return false;
     }
 
-    return rc == ERROR_SUCCESS;
+    // Verify the value was written by reading it back immediately
+    wchar_t verify_shell[512]{};
+    DWORD verify_size = sizeof(verify_shell);
+    DWORD verify_type = 0;
+
+    debug_log(L"VERBOSE: Attempting to verify written shell value...");
+
+    rc = RegQueryValueExW(path_key, L"Shell", nullptr, &verify_type,
+                         reinterpret_cast<BYTE*>(verify_shell), &verify_size);
+
+    debug_log(L"VERBOSE: RegQueryValueExW verification returned status: %lu", rc);
+    debug_log(L"VERBOSE: Type: %lu (should be %lu for REG_SZ)", verify_type, REG_SZ);
+
+    if (rc == ERROR_SUCCESS) {
+        debug_log(L"VERBOSE: Read back shell value: %s", verify_shell);
+        debug_log(L"VERBOSE: Verification size: %lu bytes", verify_size);
+    }
+
+    // Flush to ensure written to disk
+    RegFlushKey(path_key);
+    debug_log(L"VERBOSE: RegFlushKey called");
+
+    RegCloseKey(path_key);
+
+    if (rc == ERROR_SUCCESS && verify_type == REG_SZ && wcscmp(verify_shell, shell_cmd) == 0) {
+        debug_log(L"SUCCESS: Shell set and verified: %s", shell_cmd);
+        return true;
+    } else {
+        debug_log(L"ERROR: Shell value verification failed!");
+        debug_log(L"  - QueryStatus: %lu", rc);
+        debug_log(L"  - Type match: %s", (verify_type == REG_SZ) ? L"YES" : L"NO");
+        if (rc == ERROR_SUCCESS) {
+            debug_log(L"  - String match: %s", (wcscmp(verify_shell, shell_cmd) == 0) ? L"YES" : L"NO");
+            debug_log(L"  - Expected: %s", shell_cmd);
+            debug_log(L"  - Got:      %s", verify_shell);
+        }
+        return false;
+    }
 }
 
 inline void kiosk_shell_bigpicture() {
-    kiosk_set_shell(BIG_PICTURE_EXEC);
+    debug_log(L"VERBOSE: User clicked Big Picture shell button");
+    if (kiosk_set_shell(BIG_PICTURE_EXEC)) {
+        debug_log(L"SUCCESS: Big Picture shell enabled");
+    } else {
+        debug_log(L"ERROR: Failed to enable Big Picture shell");
+    }
 }
 
 inline void kiosk_shell_explorer() {
-    kiosk_set_shell(L"explorer.exe");
+    debug_log(L"VERBOSE: User clicked Explorer shell button");
+    if (kiosk_set_shell(L"explorer.exe")) {
+        debug_log(L"SUCCESS: Explorer shell enabled");
+    } else {
+        debug_log(L"ERROR: Failed to enable Explorer shell");
+    }
 }
 
 inline bool kiosk_shell_status() {
-    scoped_privileges privs { SE_BACKUP_NAME };
+    scoped_privileges privs { SE_BACKUP_NAME, SE_RESTORE_NAME };
     scoped_user_hive hive;
 
-    if (!hive.ok())
+    if (!hive.ok()) {
+        debug_log(L"WARNING: Cannot access hive to check shell status");
         return false;
+    }
+
+    HKEY key;
+    LONG rc = RegOpenKeyExW(HKEY_USERS,
+                            L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+                            0, KEY_QUERY_VALUE, &key);
+
+    if (rc != ERROR_SUCCESS) {
+        debug_log(L"VERBOSE: Cannot open Winlogon key for status check. Status: %lu", rc);
+        return false;
+    }
 
     wchar_t shell[512]{};
     DWORD size = sizeof(shell);
+    DWORD type = 0;
 
-    LONG rc = RegGetValueW(HKEY_USERS,
-                           L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
-                           L"Shell", RRF_RT_REG_SZ, nullptr, shell, &size);
+    debug_log(L"VERBOSE: About to query Shell value from registry...");
 
-    return rc == ERROR_SUCCESS && wcscmp(shell, BIG_PICTURE_EXEC) == 0;
+    rc = RegQueryValueExW(key, L"Shell", nullptr, &type,
+                         reinterpret_cast<BYTE*>(shell), &size);
+
+    debug_log(L"VERBOSE: RegQueryValueExW returned status: %lu, Type: %lu, Size: %lu", rc, type, size);
+
+    if (rc == ERROR_SUCCESS) {
+        debug_log(L"VERBOSE: Shell value read successfully: %s", shell);
+    } else {
+        debug_log(L"VERBOSE: Failed to read Shell value. Status: %lu", rc);
+    }
+
+    RegCloseKey(key);
+
+    if (rc != ERROR_SUCCESS) {
+        debug_log(L"VERBOSE: Shell value not found or error reading - returning false");
+        return false;
+    }
+
+    bool is_bigpicture = (wcscmp(shell, BIG_PICTURE_EXEC) == 0);
+    debug_log(L"INFO: Shell status check - Value: '%s', IsBigPicture: %d", 
+              shell, is_bigpicture ? 1 : 0);
+    
+    return is_bigpicture;
 }
 
 // ========================================
@@ -732,10 +957,18 @@ inline void restart_user() {
 // UI Helpers
 // ========================================
 inline void update_ui() {
-    SendMessageW(g_hwnd_autologin, BM_SETCHECK,
-                 autologin_status() ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(g_hwnd_shell, BM_SETCHECK,
-                 kiosk_shell_status() ? BST_CHECKED : BST_UNCHECKED, 0);
+    debug_log(L"VERBOSE: update_ui() called - refreshing all UI elements");
+    
+    BOOL autologin_checked = autologin_status() ? BST_CHECKED : BST_UNCHECKED;
+    debug_log(L"VERBOSE: autologin_status() returned: %d", autologin_checked);
+    SendMessageW(g_hwnd_autologin, BM_SETCHECK, autologin_checked, 0);
+    
+    BOOL shell_status = kiosk_shell_status();
+    BOOL shell_checked = shell_status ? BST_CHECKED : BST_UNCHECKED;
+    debug_log(L"VERBOSE: kiosk_shell_status() returned: %d, setting checkbox to: %d", shell_status, shell_checked);
+    SendMessageW(g_hwnd_shell, BM_SETCHECK, shell_checked, 0);
+    
+    debug_log(L"VERBOSE: update_ui() complete");
 }
 
 inline void prompt_first_login() {
@@ -793,34 +1026,54 @@ inline bool delete_kiosk_user_profile() {
         return false;
     }
 
-    if (delete_directory_recursive(STEAM_KIOSK_PROFILE_DIR)) {
-        debug_log(L"SUCCESS: Profile directory deleted");
-        return true;
+    int delete_attempts = 0;
+    const int MAX_DELETE_ATTEMPTS = 3;
+
+    while (delete_attempts < MAX_DELETE_ATTEMPTS) {
+        delete_attempts++;
+        if (delete_directory_recursive(STEAM_KIOSK_PROFILE_DIR)) {
+            debug_log(L"SUCCESS: Profile directory deleted (attempt %d)", delete_attempts);
+            return true;
+        }
+        debug_log(L"WARNING: Failed to delete profile directory (attempt %d/%d)", 
+                  delete_attempts, MAX_DELETE_ATTEMPTS);
+        Sleep(500);  // Wait before retry
     }
 
-    debug_log(L"ERROR: Failed to delete profile directory");
+    debug_log(L"ERROR: Failed to delete profile directory after %d attempts", MAX_DELETE_ATTEMPTS);
     return false;
 }
 
 inline bool destroy_kiosk_user_completely() {
     debug_log(L"INFO: Starting complete kiosk user destruction");
 
+    // Ensure we have required privileges
+    scoped_privileges privs { SE_BACKUP_NAME, SE_RESTORE_NAME };
+
     // 1. Disable autologin first
     autologin_disable();
 
-    // 2. Kill any remaining kiosk processes
-    terminate_processes_for_user(STEAM_KIOSK_USER);
-
-    // Give Windows a moment to release handles
-    Sleep(500);
-
-    // 3. Delete profile directory (NTUSER.DAT must not be loaded)
-    if (!delete_kiosk_user_profile()) {
-        debug_log(L"ERROR: Failed to delete profile directory during destruction");
-        return false;
+    // 2. Disable the user account (prevents future login)
+    // Continue even if this fails - it's not critical
+    if (!disable_kiosk_user_account()) {
+        debug_log(L"WARNING: User account disabling failed, but continuing with deletion");
     }
 
-    // 4. Delete the user account
+    // 3. Kill any remaining kiosk processes (multiple passes)
+    terminate_processes_for_user(STEAM_KIOSK_USER);
+    Sleep(1000);
+
+    // 4. Second pass to catch any lingering processes
+    terminate_processes_for_user(STEAM_KIOSK_USER);
+    Sleep(500);
+
+    // 5. Delete profile directory (NTUSER.DAT must not be loaded)
+    if (!delete_kiosk_user_profile()) {
+        debug_log(L"ERROR: Failed to delete profile directory during destruction");
+        // Don't return false yet - try to delete user anyway
+    }
+
+    // 6. Delete the user account
     kiosk_user_destroy();
 
     debug_log(L"SUCCESS: Complete kiosk user destruction finished");
@@ -830,30 +1083,29 @@ inline bool destroy_kiosk_user_completely() {
 // ========================================
 // Main Window Procedure
 // ========================================
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_COMMAND:
-        if ((HWND)lParam == h_autologin)
+        if ((HWND)lParam == g_hwnd_autologin)
             autologin_status() ? autologin_disable() : autologin_enable();
-        else if ((HWND)lParam == h_shell)
+        else if ((HWND)lParam == g_hwnd_shell)
             kiosk_shell_status() ? kiosk_shell_explorer() : kiosk_shell_bigpicture();
-        else if ((HWND)lParam == h_users_prompt)
+        else if ((HWND)lParam == g_hwnd_users_prompt)
             users_prompt_status() ? users_prompt_disable() : users_prompt_enable();
-        else if ((HWND)lParam == h_logoff)
+        else if ((HWND)lParam == g_hwnd_logoff)
             logoff_user();
-        else if ((HWND)lParam == h_restart)
+        else if ((HWND)lParam == g_hwnd_restart)
             restart_user();
-        else if ((HWND)lParam == h_delete_user)
-        {
+        else if ((HWND)lParam == g_hwnd_delete_user) {
             if (MessageBoxW(hwnd, L"Are you sure you want to delete the Steam Kiosk user?",
-                            L"Confirm Delete", MB_YESNO | MB_ICONWARNING) == IDYES)
-            {
+                            L"Confirm Delete", MB_YESNO | MB_ICONWARNING) == IDYES) {
                 if (destroy_kiosk_user_completely()) {
+                    debug_log(L"SUCCESS: User confirmed deletion - cleaning up");
                     MessageBoxW(hwnd, L"Steam Kiosk user and profile deleted successfully.",
                                 L"Deleted", MB_OK | MB_ICONINFORMATION);
                     ExitProcess(0);
                 } else {
+                    debug_log(L"ERROR: Deletion failed after user confirmation");
                     MessageBoxW(hwnd, L"Failed to delete Steam Kiosk user and/or profile.",
                                 L"Error", MB_OK | MB_ICONERROR);
                 }
@@ -876,55 +1128,91 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 // ========================================
 // Kiosk Setup
 // ========================================
-void kiosk_setup_if_needed()
-{
+void kiosk_setup_if_needed() {
+    debug_log(L"INFO: Starting kiosk setup check");
+
     if (!kiosk_user_exists()) {
+        debug_log(L"INFO: Kiosk user does not exist, creating...");
         if (!kiosk_user_create()) {
+            debug_log(L"FATAL: Failed to create Steam Kiosk user");
             MessageBoxW(nullptr, L"Failed to create Steam Kiosk user.", L"Error", MB_OK | MB_ICONERROR);
             ExitProcess(1);
         }
     }
-    
+
     int profile_status = kiosk_profile_exists();
     if (profile_status == 1) {
         // First login needed
+        debug_log(L"INFO: Profile does not exist, first login needed");
         prompt_first_login();
         users_prompt_enable();
         switch_to_other_user_screen();
-        Sleep(5000); // Give some time for the user to switch
+        Sleep(5000);  // Give some time for the user to switch
         users_prompt_disable();
         Sleep(20000);
-        MessageBoxW(nullptr, L"Please press OK to continue.\n",
-                             L"And to proceed to backuping up the profile",
-                             MB_OK | MB_ICONINFORMATION);
+        MessageBoxW(nullptr, L"Please press OK to continue and proceed to backing up the profile.",
+                    L"Profile Backup", MB_OK | MB_ICONINFORMATION);
         Sleep(1000);
         if (ntuserdat_backup()) {
+            debug_log(L"SUCCESS: Profile backed up successfully");
             MessageBoxW(nullptr, L"Profile backup created successfully.",
-                                 L"Backup Created", MB_OK | MB_ICONINFORMATION);
+                        L"Backup Created", MB_OK | MB_ICONINFORMATION);
         } else {
+            debug_log(L"ERROR: Failed to backup profile");
             MessageBoxW(nullptr, L"Failed to create profile backup.",
-                                 L"Backup Failed", MB_OK | MB_ICONERROR);
+                        L"Backup Failed", MB_OK | MB_ICONERROR);
         }
     } else if (profile_status == 3) {
+        debug_log(L"ERROR: Profile is corrupted, prompting user for restore");
         if (prompt_corrupt_profile()) {
-            // kiosk_user_destroy();
             if (ntuserdat_restore()) {
+                debug_log(L"SUCCESS: Profile restored from backup");
                 MessageBoxW(nullptr, L"Profile restored from backup. Please restart the application.",
-                                     L"Profile Restored", MB_OK | MB_ICONINFORMATION);
+                            L"Profile Restored", MB_OK | MB_ICONINFORMATION);
             } else {
-                MessageBoxW(nullptr, L"Failed to restore profile from backup. Please restart and try again.\nIf it continues, please delete NTUSER.DAT and try again. If all else fails, please delete the user and its folder and try again.",
-                                     L"Profile Restore Failed", MB_OK | MB_ICONERROR);
+                debug_log(L"ERROR: Failed to restore profile from backup");
+                MessageBoxW(nullptr, L"Failed to restore profile from backup. Please restart and try again.\n"
+                                     L"If it continues, delete NTUSER.DAT and try again.\n"
+                                     L"If all else fails, delete the user and folder and try again.",
+                            L"Profile Restore Failed", MB_OK | MB_ICONERROR);
             }
             ExitProcess(1);
+        } else {
+            debug_log(L"INFO: User declined profile restore");
         }
+    } else {
+        debug_log(L"SUCCESS: Profile exists and is healthy");
     }
 }
 
 // ========================================
 // Main Entry
 // ========================================
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
-{
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
+    debug_log(L"INFO: Application starting");
+
+    // Create or open a named mutex to ensure single instance
+    g_single_instance_mutex = CreateMutexW(nullptr, TRUE, L"Global\\SteamKioskHelper_Mutex");
+    if (!g_single_instance_mutex) {
+        debug_log(L"ERROR: Failed to create single instance mutex");
+        MessageBoxW(nullptr, L"Failed to initialize application.", L"Error", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
+    // Check if another instance is already running
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        debug_log(L"WARNING: Another instance of the application is already running. Exiting.");
+        MessageBoxW(nullptr, 
+                    L"Steam Kiosk Helper is already running.\n\n"
+                    L"Only one instance can run at a time.",
+                    L"Application Already Running", 
+                    MB_OK | MB_ICONWARNING);
+        ReleaseMutex(g_single_instance_mutex);
+        CloseHandle(g_single_instance_mutex);
+        return 1;
+    }
+
+    debug_log(L"INFO: Single instance lock acquired successfully");
     kiosk_setup_if_needed();
 
     WNDCLASSW wc{};
@@ -940,61 +1228,64 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                               nullptr, nullptr, hInst, nullptr);
 
     // Title
-    h_title = CreateWindowW(L"STATIC", L"Steam Kiosk Helper",
-                            WS_CHILD | WS_VISIBLE | SS_CENTER,
-                            0, 10, MAIN_WINDOW_WIDTH, 30,
-                            hwnd, nullptr, hInst, nullptr);
+    g_hwnd_title = CreateWindowW(L"STATIC", L"Steam Kiosk Helper",
+                                 WS_CHILD | WS_VISIBLE | SS_CENTER,
+                                 0, 10, MAIN_WINDOW_WIDTH, 30,
+                                 hwnd, nullptr, hInst, nullptr);
 
     HFONT h_font = CreateFontW(FONT_SIZE, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
 
-    SendMessageW(h_title, WM_SETFONT, (WPARAM)h_font, TRUE);
+    SendMessageW(g_hwnd_title, WM_SETFONT, (WPARAM)h_font, TRUE);
 
     // Buttons / Checkboxes 2x2 grid
     // 20+112+12+112+12+112+20 
     // ((400−(20×2))−(12×2))×1/3
-    h_autologin = CreateWindowW(L"BUTTON", L"Autologin",
-                                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                20, 60, TOGGLE_WIDTH, BUTTON_HEIGHT,
-                                hwnd, nullptr, hInst, nullptr);
+    g_hwnd_autologin = CreateWindowW(L"BUTTON", L"Autologin",
+                                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                     20, 60, TOGGLE_WIDTH, BUTTON_HEIGHT,
+                                     hwnd, nullptr, hInst, nullptr);
 
-    h_shell = CreateWindowW(L"BUTTON", L"Big-Picture Shell",
-                             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                             144, 60, TOGGLE_WIDTH, BUTTON_HEIGHT,
-                             hwnd, nullptr, hInst, nullptr);
+    g_hwnd_shell = CreateWindowW(L"BUTTON", L"Big-Picture Shell",
+                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                 144, 60, TOGGLE_WIDTH, BUTTON_HEIGHT,
+                                 hwnd, nullptr, hInst, nullptr);
 
-    h_users_prompt = CreateWindowW(L"BUTTON", L"User Prompt",
-                             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                             268, 60, TOGGLE_WIDTH, BUTTON_HEIGHT,
-                             hwnd, nullptr, hInst, nullptr);
+    g_hwnd_users_prompt = CreateWindowW(L"BUTTON", L"User Prompt",
+                                        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                        268, 60, TOGGLE_WIDTH, BUTTON_HEIGHT,
+                                        hwnd, nullptr, hInst, nullptr);
 
-    h_logoff = CreateWindowW(L"BUTTON", L"Log Off",
-                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                              50, 120, BUTTON_WIDTH, BUTTON_HEIGHT,
-                              hwnd, nullptr, hInst, nullptr);
+    g_hwnd_logoff = CreateWindowW(L"BUTTON", L"Log Off",
+                                  WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                  50, 120, BUTTON_WIDTH, BUTTON_HEIGHT,
+                                  hwnd, nullptr, hInst, nullptr);
 
-    h_restart = CreateWindowW(L"BUTTON", L"Restart",
-                               WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                               220, 120, BUTTON_WIDTH, BUTTON_HEIGHT,
-                               hwnd, nullptr, hInst, nullptr);
-                               // Delete User button (bottom middle)
-    h_delete_user = CreateWindowW(L"BUTTON", L"Delete User",
-                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                              (MAIN_WINDOW_WIDTH - BUTTON_WIDTH) / 2, // center horizontally
-                              180, // below the 2x2 grid (adjust spacing)
-                              BUTTON_WIDTH, BUTTON_HEIGHT,
-                              hwnd, nullptr, hInst, nullptr);
+    g_hwnd_restart = CreateWindowW(L"BUTTON", L"Restart",
+                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                   220, 120, BUTTON_WIDTH, BUTTON_HEIGHT,
+                                   hwnd, nullptr, hInst, nullptr);
 
-    SendMessageW(h_autologin, WM_SETFONT, (WPARAM)h_font, TRUE);
-    SendMessageW(h_shell, WM_SETFONT, (WPARAM)h_font, TRUE);
-    SendMessageW(h_users_prompt, WM_SETFONT, (WPARAM)h_font, TRUE);
-    SendMessageW(h_logoff, WM_SETFONT, (WPARAM)h_font, TRUE);
-    SendMessageW(h_restart, WM_SETFONT, (WPARAM)h_font, TRUE);
-    SendMessageW(h_delete_user, WM_SETFONT, (WPARAM)h_font, TRUE);
+    // Delete User button (bottom middle)
+    g_hwnd_delete_user = CreateWindowW(L"BUTTON", L"Delete User",
+                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                       (MAIN_WINDOW_WIDTH - BUTTON_WIDTH) / 2,
+                                       180,
+                                       BUTTON_WIDTH, BUTTON_HEIGHT,
+                                       hwnd, nullptr, hInst, nullptr);
+
+    SendMessageW(g_hwnd_autologin, WM_SETFONT, (WPARAM)h_font, TRUE);
+    SendMessageW(g_hwnd_shell, WM_SETFONT, (WPARAM)h_font, TRUE);
+    SendMessageW(g_hwnd_users_prompt, WM_SETFONT, (WPARAM)h_font, TRUE);
+    SendMessageW(g_hwnd_logoff, WM_SETFONT, (WPARAM)h_font, TRUE);
+    SendMessageW(g_hwnd_restart, WM_SETFONT, (WPARAM)h_font, TRUE);
+    SendMessageW(g_hwnd_delete_user, WM_SETFONT, (WPARAM)h_font, TRUE);
 
     ShowWindow(hwnd, SW_SHOW);
     update_ui();
+
+    debug_log(L"INFO: Main window created and displayed");
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -1002,5 +1293,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         DispatchMessageW(&msg);
     }
 
+    // Clean up single instance mutex
+    if (g_single_instance_mutex) {
+        ReleaseMutex(g_single_instance_mutex);
+        CloseHandle(g_single_instance_mutex);
+        debug_log(L"INFO: Single instance mutex released");
+    }
+
+    debug_log(L"INFO: Application exiting");
     return 0;
 }
