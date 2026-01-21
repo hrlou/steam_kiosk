@@ -646,12 +646,17 @@ inline void kiosk_user_destroy() {
 // ========================================
 // Kiosk Profile
 // ========================================
+// rename status
 inline int kiosk_profile_exists() {
     // Return codes:
     // 0 = profile exists and hive is readable
     // 1 = profile missing (NTUSER.DAT not present)
+    // 2 = running as kiosk
     // 3 = profile present but hive could not be loaded (corrupt/unreadable)
 
+    if (is_running_as_steam_kiosk()) {
+        return 2;
+    }
     if (GetFileAttributesW(STEAM_KIOSK_HIVE) == INVALID_FILE_ATTRIBUTES) {
         debug_log(L"INFO: Kiosk profile does not exist yet");
         return 1;
