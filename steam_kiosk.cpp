@@ -143,11 +143,35 @@ inline bool is_running_as_steam_kiosk() {
     return is_kiosk;
 }
 
+// Get the appropriate registry root based on current user context
+// When running as steam_kiosk: returns HKEY_CURRENT_USER (active hive)
+// When running as admin/foreign: returns HKEY_USERS\STEAM_KIOSK (loaded hive)
+inline HKEY get_user_registry_root() {
+    if (is_running_as_steam_kiosk()) {
+        debug_log(L"VERBOSE: Using HKEY_CURRENT_USER for registry access");
+        return HKEY_CURRENT_USER;
+    }
+    debug_log(L"VERBOSE: Using HKEY_USERS\\STEAM_KIOSK for registry access");
+    return HKEY_USERS;  // Will be used with "STEAM_KIOSK" subpath
+}
+
+// Build the registry path based on current user context
+// When running as steam_kiosk: empty path (use subkey directly under HKEY_CURRENT_USER)
+// When running as admin/foreign: prepend "STEAM_KIOSK\" to the path
+inline void build_user_registry_path(LPCWSTR subkey, wchar_t* full_path, size_t max_len) {
+    if (is_running_as_steam_kiosk()) {
+        wcscpy_s(full_path, max_len, subkey);
+    } else {
+        swprintf_s(full_path, max_len, L"STEAM_KIOSK\\%s", subkey);
+    }
+}
+
 struct scoped_user_hive {
 
     const wchar_t* hive_name = L"STEAM_KIOSK";
     wchar_t temp_hive[MAX_PATH]{};
     bool loaded = false;
+    bool is_kiosk_user = false;  // Track if we're running as steam_kiosk
 
     // ========================================
     // NTUSER.DAT Validation
@@ -201,10 +225,24 @@ struct scoped_user_hive {
     }
 
     scoped_user_hive() {
-        // Ensure the local working directory exists and create a unique temp file
+        // Ensure the local working directory exists
         ensure_local_path();
 
         debug_log(L"INFO: Initializing scoped_user_hive");
+
+        // Detect if we're running as the steam_kiosk user
+        is_kiosk_user = is_running_as_steam_kiosk();
+
+        if (is_kiosk_user) {
+            // When running as steam_kiosk, we can use HKEY_CURRENT_USER directly
+            // since it maps to the active user's hive. No need to load/unload.
+            debug_log(L"INFO: Running as steam_kiosk user - using HKEY_CURRENT_USER directly");
+            loaded = true;  // Mark as "loaded" so registry operations work
+            return;
+        }
+
+        // Admin/foreign user path: load the hive from disk
+        debug_log(L"INFO: Running as admin/foreign user - loading hive from disk");
 
         // Validate the source hive before copying
         if (!validate_hive_file(STEAM_KIOSK_HIVE)) {
@@ -249,6 +287,12 @@ struct scoped_user_hive {
     }
 
     ~scoped_user_hive() {
+        if (is_kiosk_user) {
+            // When running as steam_kiosk, no cleanup needed - we used HKEY_CURRENT_USER
+            debug_log(L"INFO: Cleanup for steam_kiosk user (no unload needed)");
+            return;
+        }
+
         if (loaded) {
             debug_log(L"INFO: Unloading hive from registry");
             RegUnLoadKeyW(HKEY_USERS, hive_name);
@@ -257,6 +301,7 @@ struct scoped_user_hive {
             // so changes persist between application runs
             if (!CopyFileW(temp_hive, STEAM_KIOSK_HIVE, FALSE)) {
                 debug_log(L"ERROR: Failed to copy modified hive back to NTUSER.DAT. LastError: %lu", 
+", 
                           GetLastError());
             } else {
                 debug_log(L"INFO: Modified hive successfully copied back to NTUSER.DAT");
