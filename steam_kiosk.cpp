@@ -19,6 +19,7 @@ inline constexpr auto STEAM_EXE_PATH    = L"C:\\Program Files (x86)\\Steam\\stea
 inline constexpr auto BIG_PICTURE_EXEC  = L"C:\\Program Files (x86)\\Steam\\steam.exe -bigpicture";
 inline constexpr auto STEAM_KIOSK_USER  = L"steam_kiosk";
 inline constexpr auto STEAM_KIOSK_PASS  = L"valve";
+inline constexpr auto STEAM_KIOSK_HIVE  = L"C:\\Users\\steam_kiosk\\NTUSER.DAT";
 
 inline constexpr int MAIN_WINDOW_WIDTH  = 400;
 inline constexpr int MAIN_WINDOW_HEIGHT = 200;
@@ -112,7 +113,7 @@ inline void kiosk_user_destroy()
 inline int kiosk_profile_exists() {
     const wchar_t* hive_name = L"STEAM_KIOSK";
     wchar_t user_hive[MAX_PATH]{};
-    swprintf_s(user_hive, L"C:\\Users\\%s\\NTUSER.DAT", STEAM_KIOSK_USER);
+    swprintf_s(user_hive, STEAM_KIOSK_HIVE);
 
     if (GetFileAttributesW(user_hive) == INVALID_FILE_ATTRIBUTES)  
         return 1;
@@ -249,7 +250,7 @@ inline void kiosk_shell_bigpicture()
 
     const wchar_t* hive_name = L"STEAM_KIOSK";
     wchar_t user_hive[MAX_PATH]{};
-    swprintf_s(user_hive, L"C:\\Users\\%s\\NTUSER.DAT", STEAM_KIOSK_USER);
+    swprintf_s(user_hive, STEAM_KIOSK_HIVE);
 
     if (RegLoadKeyW(HKEY_USERS, hive_name, user_hive) != ERROR_SUCCESS)
         return;
@@ -283,7 +284,7 @@ inline void kiosk_shell_explorer()
 
     const wchar_t* hive_name = L"STEAM_KIOSK";
     wchar_t user_hive[MAX_PATH]{};
-    swprintf_s(user_hive, L"C:\\Users\\%s\\NTUSER.DAT", STEAM_KIOSK_USER);
+    swprintf_s(user_hive, STEAM_KIOSK_HIVE);
 
     if (RegLoadKeyW(HKEY_USERS, hive_name, user_hive) != ERROR_SUCCESS)
         return;
@@ -308,7 +309,7 @@ inline bool kiosk_shell_status()
 {
     const wchar_t* hive_name = L"STEAM_KIOSK";
     wchar_t user_hive[MAX_PATH]{};
-    swprintf_s(user_hive, L"C:\\Users\\%s\\NTUSER.DAT", STEAM_KIOSK_USER);
+    swprintf_s(user_hive, STEAM_KIOSK_HIVE);
 
     if (RegLoadKeyW(HKEY_USERS, hive_name, user_hive) != ERROR_SUCCESS)
         return false;
@@ -351,19 +352,26 @@ inline void prompt_first_login()
     swprintf_s(msg, L"Steam Kiosk user created.\n\n"
                     L"Please log in once using username: %s\n"
                     L"Password: %s\n\n"
-                    L"After login, the UI will function properly.",
+                    L"After logging into the kiosk user, wait for initialisation then log out.\n"
+                    L"Then log back into your personal user account and return to this helper.",
             STEAM_KIOSK_USER, STEAM_KIOSK_PASS);
 
     MessageBoxW(nullptr, msg, L"Steam Kiosk Setup", MB_OK | MB_ICONINFORMATION);
 }
 
-inline void prompt_corrupt_profile()
+inline bool prompt_corrupt_profile()
 {
-    wchar_t msg[64];
-    swprintf_s(msg, L"NTUSER.DAT for `%s` is corrupted and unreadable!\n\n",
-                    L"The program will attempt to recreate the user profile on next run.",
-        STEAM_KIOSK_USER);
-    MessageBoxW(nullptr, msg, L"Steam Kiosk Setup", MB_OK | MB_ICONERROR);
+    wchar_t msg[256];
+    swprintf_s(msg, L"NTUSER.DAT for `%s` is corrupted and unreadable!\n\n"
+                    L"Certain functionality may not work correctly.\n"
+                    L"Please destroy the user profile and attempt running again.\n\n"
+                    L"Do you wish to continue?",
+              STEAM_KIOSK_USER);
+
+    int result = MessageBoxW(nullptr, msg, L"Steam Kiosk Setup",
+                             MB_YESNO | MB_ICONERROR);
+
+    return result == IDYES; // true if user clicked Yes, false if No
 }
 
 inline void switch_to_other_user_screen()
@@ -412,22 +420,20 @@ void kiosk_setup_if_needed()
             ExitProcess(1);
         }
     }
-
     
     int profile_status = kiosk_profile_exists();
-    if (profile_status != 0) {
-        if (profile_status == 1) {
-            // First login needed
-            prompt_first_login();
-            // users_prompt_enable();
-            // switch_to_other_user_screen();
-            // users_prompt_disable();
-        } else if (profile_status == 3) {
-            prompt_corrupt_profile();
+    if (profile_status == 1) {
+        // First login needed
+        prompt_first_login();
+        users_prompt_enable();
+        switch_to_other_user_screen();
+        Sleep(10000); // Give some time for the user to switch
+        users_prompt_disable();
+    } else if (profile_status == 3) {
+        if (!prompt_corrupt_profile()) {
+            // kiosk_user_destroy();
             ExitProcess(1);
         }
-
-        ExitProcess(0);
     }
 }
 
