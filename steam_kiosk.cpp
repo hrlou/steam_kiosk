@@ -301,7 +301,6 @@ struct scoped_user_hive {
             // so changes persist between application runs
             if (!CopyFileW(temp_hive, STEAM_KIOSK_HIVE, FALSE)) {
                 debug_log(L"ERROR: Failed to copy modified hive back to NTUSER.DAT. LastError: %lu", 
-", 
                           GetLastError());
             } else {
                 debug_log(L"INFO: Modified hive successfully copied back to NTUSER.DAT");
@@ -866,10 +865,16 @@ inline bool kiosk_set_shell(LPCWSTR shell_cmd) {
         return false;
     }
 
+    // Build the correct registry path based on current user context
+    wchar_t reg_path[MAX_PATH];
+    build_user_registry_path(L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", 
+                             reg_path, sizeof(reg_path) / sizeof(reg_path[0]));
+    
+    HKEY root = get_user_registry_root();
+
     // First, ensure the registry path exists - create it if needed
     HKEY path_key;
-    LONG rc = RegCreateKeyExW(HKEY_USERS,
-                              L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+    LONG rc = RegCreateKeyExW(root, reg_path,
                               0, nullptr, REG_OPTION_NON_VOLATILE,
                               KEY_SET_VALUE | KEY_QUERY_VALUE, nullptr, &path_key, nullptr);
 
@@ -962,9 +967,15 @@ inline bool kiosk_shell_status() {
         return false;
     }
 
+    // Build the correct registry path based on current user context
+    wchar_t reg_path[MAX_PATH];
+    build_user_registry_path(L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", 
+                             reg_path, sizeof(reg_path) / sizeof(reg_path[0]));
+    
+    HKEY root = get_user_registry_root();
+
     HKEY key;
-    LONG rc = RegOpenKeyExW(HKEY_USERS,
-                            L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+    LONG rc = RegOpenKeyExW(root, reg_path,
                             0, KEY_QUERY_VALUE, &key);
 
     if (rc != ERROR_SUCCESS) {
