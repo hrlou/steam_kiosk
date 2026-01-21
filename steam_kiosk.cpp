@@ -139,7 +139,7 @@ inline bool is_running_as_steam_kiosk() {
     }
     
     bool is_kiosk = (wcscmp(username, STEAM_KIOSK_USER) == 0);
-    debug_log(L"INFO: Current user detected: %s (Is steam_kiosk: %d)", username, is_kiosk ? 1 : 0);
+    debug_log(L"INFO: Current user detected: %s (steam_kiosk: %s)", username, is_kiosk ? "true" : "false");
     return is_kiosk;
 }
 
