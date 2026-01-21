@@ -5,6 +5,7 @@
 #define _UNICODE
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <wchar.h>
 #include <lm.h>
 #include <wtsapi32.h>
@@ -14,11 +15,13 @@
 // ========================================
 // Constants
 // ========================================
-inline constexpr auto STATE_PATH        = L"C:\\tools\\steam_shell\\state.json";
+inline constexpr auto LOCAL_PATH        = L"C:\\tools\\steam_shell\\local";
+inline constexpr auto NTUSER_BACKUP_PATH = L"C:\\tools\\steam_shell\\local\\NTUSER_BACKUP.DAT";
 inline constexpr auto STEAM_EXE_PATH    = L"C:\\Program Files (x86)\\Steam\\steam.exe";
 inline constexpr auto BIG_PICTURE_EXEC  = L"C:\\Program Files (x86)\\Steam\\steam.exe -bigpicture";
 inline constexpr auto STEAM_KIOSK_USER  = L"steam_kiosk";
 inline constexpr auto STEAM_KIOSK_PASS  = L"valve";
+inline constexpr auto STEAM_KIOSK_PROFILE_DIR = L"C:\\Users\\steam_kiosk";
 inline constexpr auto STEAM_KIOSK_HIVE  = L"C:\\Users\\steam_kiosk\\NTUSER.DAT";
 
 inline constexpr int MAIN_WINDOW_WIDTH  = 400;
@@ -87,7 +90,7 @@ struct scoped_user_hive {
     bool loaded = false;
 
     scoped_user_hive() {
-        swprintf_s(temp_hive, L"C:\\tools\\steam_shell\\NTUSER_TEMP.DAT");
+        swprintf_s(temp_hive, L"C:\\tools\\steam_shell\\local\\NTUSER_TEMP.DAT");
 
         if (!CopyFileW(STEAM_KIOSK_HIVE, temp_hive, FALSE))
             return;
@@ -105,6 +108,150 @@ struct scoped_user_hive {
 
     bool ok() const { return loaded; }
 };
+
+// ========================================
+// Misc Helpers
+// ========================================
+inline void ensure_local_path()
+{
+    CreateDirectoryW(LOCAL_PATH, nullptr);
+}
+
+inline bool delete_directory_recursive(const wchar_t* path)
+{
+    wchar_t search_path[MAX_PATH];
+    swprintf_s(search_path, L"%s\\*", path);
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h_find = FindFirstFileW(search_path, &fd);
+
+    if (h_find == INVALID_HANDLE_VALUE)
+        return false;
+
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 ||
+            wcscmp(fd.cFileName, L"..") == 0)
+            continue;
+
+        wchar_t full_path[MAX_PATH];
+        swprintf_s(full_path, L"%s\\%s", path, fd.cFileName);
+
+        // Clear attributes (readonly/system)
+        SetFileAttributesW(full_path, FILE_ATTRIBUTE_NORMAL);
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!delete_directory_recursive(full_path)) {
+                FindClose(h_find);
+                return false;
+            }
+        } else {
+            if (!DeleteFileW(full_path)) {
+                FindClose(h_find);
+                return false;
+            }
+        }
+    } while (FindNextFileW(h_find, &fd));
+
+    FindClose(h_find);
+
+    // Finally remove the now-empty directory
+    SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+    return RemoveDirectoryW(path) != FALSE;
+}
+
+inline bool terminate_processes_for_user(const wchar_t* username)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return false;
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+
+    if (!Process32FirstW(snap, &pe)) {
+        CloseHandle(snap);
+        return false;
+    }
+
+    do {
+        HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
+                                  PROCESS_TERMINATE,
+                                  FALSE, pe.th32ProcessID);
+        if (!proc)
+            continue;
+
+        HANDLE token;
+        if (OpenProcessToken(proc, TOKEN_QUERY, &token)) {
+            DWORD size = 0;
+            GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+
+            if (size) {
+                BYTE buf[512];
+                if (size <= sizeof(buf) &&
+                    GetTokenInformation(token, TokenUser, buf, size, &size))
+                {
+                    TOKEN_USER* tu = reinterpret_cast<TOKEN_USER*>(buf);
+
+                    wchar_t name[128], domain[128];
+                    DWORD nlen = 128, dlen = 128;
+                    SID_NAME_USE use;
+
+                    if (LookupAccountSidW(nullptr, tu->User.Sid,
+                                           name, &nlen,
+                                           domain, &dlen, &use))
+                    {
+                        if (_wcsicmp(name, username) == 0) {
+                            TerminateProcess(proc, 1);
+                        }
+                    }
+                }
+            }
+            CloseHandle(token);
+        }
+        CloseHandle(proc);
+    } while (Process32NextW(snap, &pe));
+
+    CloseHandle(snap);
+    return true;
+}
+
+// ========================================
+// NTUSER.DAT Helpers
+// ========================================
+inline bool ntuserdat_backup()
+{
+    ensure_local_path();
+
+    // Do not overwrite an existing baseline
+    if (GetFileAttributesW(NTUSER_BACKUP_PATH) != INVALID_FILE_ATTRIBUTES)
+        return true;
+
+    return CopyFileW(
+        STEAM_KIOSK_HIVE,
+        NTUSER_BACKUP_PATH,
+        TRUE   // fail if already exists
+    ) != FALSE;
+}
+
+inline bool ntuserdat_restore()
+{
+    // Backup must exist
+    if (GetFileAttributesW(NTUSER_BACKUP_PATH) == INVALID_FILE_ATTRIBUTES)
+        return false;
+
+    // Live hive must exist
+    if (GetFileAttributesW(STEAM_KIOSK_HIVE) == INVALID_FILE_ATTRIBUTES)
+        return false;
+
+    // Best effort: remove attributes that might block overwrite
+    SetFileAttributesW(STEAM_KIOSK_HIVE, FILE_ATTRIBUTE_NORMAL);
+
+    return CopyFileW(
+        NTUSER_BACKUP_PATH,
+        STEAM_KIOSK_HIVE,
+        FALSE   // overwrite
+    ) != FALSE;
+}
 
 // ========================================
 // Privileges
@@ -127,7 +274,8 @@ inline bool system_privilege_enable(HANDLE h_token, LPCWSTR privilege, BOOL enab
 
 // ========================================
 // User Management
-// ========================================
+// =======================================
+
 inline bool kiosk_user_exists()
 {
     USER_INFO_0* buf = nullptr;
@@ -221,8 +369,6 @@ inline void autologin_disable()
         RegFlushKey(h_key);
         RegCloseKey(h_key);
     }
-
-    DeleteFileW(STATE_PATH);
 }
 
 inline bool autologin_status()
@@ -427,7 +573,7 @@ inline bool prompt_corrupt_profile()
     swprintf_s(msg, L"NTUSER.DAT for `%s` is corrupted and unreadable!\n\n"
                     L"Certain functionality may not work correctly.\n"
                     L"Please destroy the user profile and attempt running again.\n\n"
-                    L"Do you wish to continue?",
+                    L"Attempt to restore from backup?",
               STEAM_KIOSK_USER);
 
     int result = MessageBoxW(nullptr, msg, L"Steam Kiosk Setup",
@@ -443,6 +589,45 @@ inline void switch_to_other_user_screen()
                          WTS_CURRENT_SESSION, FALSE);
 }
 
+// ======================================== 
+// Delete User Profile
+// ========================================
+inline bool delete_kiosk_user_profile()
+{
+    DWORD attrs = GetFileAttributesW(STEAM_KIOSK_PROFILE_DIR);
+
+    // Nothing to do
+    if (attrs == INVALID_FILE_ATTRIBUTES)
+        return true;
+
+    // Must be a directory
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY))
+        return false;
+
+    return delete_directory_recursive(STEAM_KIOSK_PROFILE_DIR);
+}
+
+inline bool destroy_kiosk_user_completely()
+{
+    // 1. Disable autologin first
+    autologin_disable();
+
+    // 2. Kill any remaining kiosk processes
+    terminate_processes_for_user(STEAM_KIOSK_USER);
+
+    // Give Windows a moment to release handles
+    Sleep(500);
+
+    // 3. Delete profile directory (NTUSER.DAT must not be loaded)
+    if (!delete_kiosk_user_profile())
+        return false;
+
+    // 4. Delete the user account
+    kiosk_user_destroy();
+
+    return true;
+}
+
 // ========================================
 // Main Window Procedure
 // ========================================
@@ -452,8 +637,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_COMMAND:
         if ((HWND)lParam == h_autologin)
             autologin_status() ? autologin_disable() : autologin_enable();
-        else if ((HWND)lParam == h_shell)
-            kiosk_shell_status() ? kiosk_shell_explorer() : kiosk_shell_bigpicture();
+        // else if ((HWND)lParam == h_shell)
+            // kiosk_shell_status() ? kiosk_shell_explorer() : kiosk_shell_bigpicture();
         else if ((HWND)lParam == h_users_prompt)
             users_prompt_status() ? users_prompt_disable() : users_prompt_enable();
         else if ((HWND)lParam == h_logoff)
@@ -465,8 +650,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (MessageBoxW(hwnd, L"Are you sure you want to delete the Steam Kiosk user?",
                             L"Confirm Delete", MB_YESNO | MB_ICONWARNING) == IDYES)
             {
-                kiosk_user_destroy();
-                MessageBoxW(hwnd, L"Steam Kiosk user deleted.\nPlease delete its folder", L"Deleted", MB_OK | MB_ICONINFORMATION);
+                if (destroy_kiosk_user_completely()) {
+                    MessageBoxW(hwnd, L"Steam Kiosk user and profile deleted successfully.",
+                                L"Deleted", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    MessageBoxW(hwnd, L"Failed to delete Steam Kiosk user and/or profile.",
+                                L"Error", MB_OK | MB_ICONERROR);
+                }
                 update_ui();
             }
         }
@@ -501,11 +691,23 @@ void kiosk_setup_if_needed()
         prompt_first_login();
         users_prompt_enable();
         switch_to_other_user_screen();
-        Sleep(10000); // Give some time for the user to switch
+        Sleep(5000); // Give some time for the user to switch
         users_prompt_disable();
+        Sleep(20000);
+        MessageBoxW(nullptr, L"Please press OK to continue.\n",
+                             L"And to proceed to backuping up the profile",
+                             MB_OK | MB_ICONINFORMATION);
+        ntuserdat_backup();
     } else if (profile_status == 3) {
-        if (!prompt_corrupt_profile()) {
+        if (prompt_corrupt_profile()) {
             // kiosk_user_destroy();
+            if (ntuserdat_restore()) {
+                MessageBoxW(nullptr, L"Profile restored from backup. Please restart the application.",
+                                     L"Profile Restored", MB_OK | MB_ICONINFORMATION);
+            } else {
+                MessageBoxW(nullptr, L"Failed to restore profile from backup. Please restart and try again.\nIf it continues, please delete NTUSER.DAT and try again. If all else fails, please delete the user and its folder and try again.",
+                                     L"Profile Restore Failed", MB_OK | MB_ICONERROR);
+            }
             ExitProcess(1);
         }
     }
