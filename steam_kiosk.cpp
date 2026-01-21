@@ -331,12 +331,14 @@ inline void update_ui()
 
 inline void prompt_first_login()
 {
-    MessageBoxW(nullptr,
-        L"Steam Kiosk user created.\n\n"
-        L"Please log in once using username: steam_kiosk\n"
-        L"Password: valve\n\n"
-        L"After login, the UI will function properly.",
-        L"Steam Kiosk Setup", MB_OK | MB_ICONINFORMATION);
+    wchar_t msg[512];
+    swprintf_s(msg, L"Steam Kiosk user created.\n\n"
+                    L"Please log in once using username: %s\n"
+                    L"Password: %s\n\n"
+                    L"After login, the UI will function properly.",
+            STEAM_KIOSK_USER, STEAM_KIOSK_PASS);
+
+    MessageBoxW(nullptr, msg, L"Steam Kiosk Setup", MB_OK | MB_ICONINFORMATION);
 }
 
 inline void switch_to_other_user_screen()
@@ -385,16 +387,15 @@ void kiosk_setup_if_needed()
             ExitProcess(1);
         }
     }
-
     if (!kiosk_profile_exists()) {
-        autologin_enable();
         prompt_first_login();
         users_prompt_enable();
         switch_to_other_user_screen();
+        users_prompt_disable();
         ExitProcess(0);
+    } else {
+        users_prompt_disable();
     }
-
-    autologin_disable();
 }
 
 // ========================================
