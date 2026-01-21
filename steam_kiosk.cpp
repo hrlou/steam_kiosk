@@ -950,8 +950,41 @@ inline void logoff_user() {
 
 inline void restart_user() {
     debug_log(L"INFO: Initiating system restart");
-    ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0);
+    scoped_privileges privs{ SE_SHUTDOWN_NAME };
+    if (!ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0)) {
+        debug_log(L"ERROR: Failed to initiate restart. Error: %lu", GetLastError());
+        MessageBoxW(nullptr, L"Failed to restart system.\n\nEnsure the application is running with administrator privileges.",
+                    L"Restart Error", MB_OK | MB_ICONERROR);
+    }
 }
+
+// ========================================
+// Future: Loading Screen / Splash Screen
+// ========================================
+// TODO: Implement console-style custom loading animation to replace Windows loading screen
+// This would display a full-screen overlay with:
+//   - ASCII art or simple text animation
+//   - Custom progress indicators
+//   - Hide all Windows UI elements
+// 
+// HWND create_splash_screen() - Creates a borderless full-screen window
+// void show_loading_animation() - Displays loading progress with custom graphics
+// void hide_splash_screen(HWND hwnd) - Cleans up splash screen
+
+// ========================================
+// Future: Autologin UI Concealment
+// ========================================
+// TODO: When autologin is enabled, create a full-screen overlay that:
+//   - Covers the entire display during boot
+//   - Shows a custom "booting" or "loading" message
+//   - Prevents visibility of Windows components during startup
+//   - Automatically closes when Steam Big Picture is ready
+//
+// Implementation notes:
+//   - Use SetWindowPos(hwnd, HWND_TOPMOST, ...) to keep overlay above all windows
+//   - Create window with WS_POPUP style for borderless appearance
+//   - Use CreateThread to monitor for Steam process creation
+//   - Close overlay once Steam process is detected and fully loaded
 
 // ========================================
 // UI Helpers
