@@ -1,4 +1,5 @@
-./local/*
--./local/.gitkeep
+local
+local/*
+-local/.gitkeep
 steam_kiosk.obj
 steam_kiosk.exe

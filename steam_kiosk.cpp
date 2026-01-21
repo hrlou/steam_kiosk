@@ -128,35 +128,120 @@ struct scoped_user_hive {
     wchar_t temp_hive[MAX_PATH]{};
     bool loaded = false;
 
+    // ========================================
+    // NTUSER.DAT Validation
+    // ========================================
+    inline bool validate_hive_file(const wchar_t* path) {
+        // Check if file exists and has minimum size
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) {
+            debug_log(L"ERROR: Hive file not found: %s", path);
+            return false;
+        }
+
+        // NTUSER.DAT should be at least 4KB
+        ULARGE_INTEGER file_size;
+        file_size.LowPart = fad.nFileSizeLow;
+        file_size.HighPart = fad.nFileSizeHigh;
+
+        if (file_size.QuadPart < HIVE_VALIDATION_SIZE) {
+            debug_log(L"ERROR: Hive file is too small (%llu bytes). Possible corruption: %s",
+                      file_size.QuadPart, path);
+            return false;
+        }
+
+        // Check registry hive signature (first 4 bytes should be "regf")
+        HANDLE h_file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h_file == INVALID_HANDLE_VALUE) {
+            debug_log(L"ERROR: Cannot open hive file for validation: %s", path);
+            return false;
+        }
+
+        BYTE signature[4] = {};
+        DWORD bytes_read = 0;
+        BOOL read_ok = ReadFile(h_file, signature, 4, &bytes_read, nullptr);
+        CloseHandle(h_file);
+
+        if (!read_ok || bytes_read != 4) {
+            debug_log(L"ERROR: Cannot read hive signature from: %s", path);
+            return false;
+        }
+
+        // Registry hive files should start with "regf" (0x72656766)
+        if (signature[0] != 'r' || signature[1] != 'e' || 
+            signature[2] != 'g' || signature[3] != 'f') {
+            debug_log(L"ERROR: Invalid hive signature. File is corrupted: %s", path);
+            return false;
+        }
+
+        debug_log(L"VALIDATED: Hive file is valid: %s (%llu bytes)", path, file_size.QuadPart);
+        return true;
+    }
+
     scoped_user_hive() {
         // Ensure the local working directory exists and create a unique temp file
         ensure_local_path();
 
+        debug_log(L"INFO: Initializing scoped_user_hive");
+
+        // Validate the source hive before copying
+        if (!validate_hive_file(STEAM_KIOSK_HIVE)) {
+            debug_log(L"ERROR: Source hive validation failed");
+            return;
+        }
+
         // Create a unique temp name in the repo-local `local` directory to avoid
         // collisions with other runs/processes. GetTempFileNameW will create the
         // file — we'll overwrite it with a copy of the hive.
-        if (GetTempFileNameW(LOCAL_PATH, L"KHI", 0, temp_hive) == 0)
+        if (GetTempFileNameW(LOCAL_PATH, L"KHI", 0, temp_hive) == 0) {
+            debug_log(L"ERROR: Failed to generate temporary hive filename");
             return;
+        }
+
+        debug_log(L"INFO: Created temporary hive path: %s", temp_hive);
 
         // Copy the live hive into the temp location. Overwrite any existing temp.
         if (!CopyFileW(STEAM_KIOSK_HIVE, temp_hive, FALSE)) {
-            // remove the temp file created by GetTempFileNameW
+            debug_log(L"ERROR: Failed to copy hive to temporary location. LastError: %lu",
+                      GetLastError());
             DeleteFileW(temp_hive);
             return;
         }
 
-        if (RegLoadKeyW(HKEY_USERS, hive_name, temp_hive) == ERROR_SUCCESS)
+        // Validate the copied hive
+        if (!validate_hive_file(temp_hive)) {
+            debug_log(L"ERROR: Temporary hive copy validation failed - source may be corrupted");
+            DeleteFileW(temp_hive);
+            return;
+        }
+
+        debug_log(L"INFO: Temporary hive copy validated successfully");
+
+        if (RegLoadKeyW(HKEY_USERS, hive_name, temp_hive) == ERROR_SUCCESS) {
             loaded = true;
+            debug_log(L"INFO: Hive loaded successfully into registry");
+        } else {
+            debug_log(L"ERROR: Failed to load hive into registry. LastError: %lu", GetLastError());
+            DeleteFileW(temp_hive);
+        }
     }
 
     ~scoped_user_hive() {
         if (loaded) {
+            debug_log(L"INFO: Unloading hive from registry");
             RegUnLoadKeyW(HKEY_USERS, hive_name);
-            DeleteFileW(temp_hive);
+            if (!DeleteFileW(temp_hive)) {
+                debug_log(L"WARNING: Failed to delete temporary hive file: %s", temp_hive);
+            } else {
+                debug_log(L"INFO: Temporary hive file deleted");
+            }
         }
     }
 
-    bool ok() const { return loaded; }
+    bool ok() const {
+        return loaded;
+    }
 };
 
 // ========================================
@@ -264,89 +349,114 @@ inline bool terminate_processes_for_user(const wchar_t* username)
 // ========================================
 // NTUSER.DAT Helpers
 // ========================================
-inline bool ntuserdat_backup()
-{
+inline bool ntuserdat_backup() {
     ensure_local_path();
 
-    // Do not overwrite an existing baseline
-    if (GetFileAttributesW(NTUSER_BACKUP_PATH) != INVALID_FILE_ATTRIBUTES)
-        return true;
+    debug_log(L"INFO: Starting NTUSER.DAT backup");
 
-    return CopyFileW(
-        STEAM_KIOSK_HIVE,
-        NTUSER_BACKUP_PATH,
-        TRUE   // fail if already exists
-    ) != FALSE;
+    // Do not overwrite an existing baseline
+    if (GetFileAttributesW(NTUSER_BACKUP_PATH) != INVALID_FILE_ATTRIBUTES) {
+        debug_log(L"INFO: Backup already exists, skipping backup creation");
+        return true;
+    }
+
+    if (!CopyFileW(STEAM_KIOSK_HIVE, NTUSER_BACKUP_PATH, TRUE)) {
+        debug_log(L"ERROR: Failed to create backup. LastError: %lu", GetLastError());
+        return false;
+    }
+
+    debug_log(L"SUCCESS: Profile backup created successfully: %s", NTUSER_BACKUP_PATH);
+    return true;
 }
 
-inline bool ntuserdat_restore()
-{
+inline bool ntuserdat_restore() {
+    debug_log(L"INFO: Starting NTUSER.DAT restore");
+
     // Backup must exist
-    if (GetFileAttributesW(NTUSER_BACKUP_PATH) == INVALID_FILE_ATTRIBUTES)
+    if (GetFileAttributesW(NTUSER_BACKUP_PATH) == INVALID_FILE_ATTRIBUTES) {
+        debug_log(L"ERROR: Backup file not found: %s", NTUSER_BACKUP_PATH);
         return false;
+    }
 
     // Live hive must exist
-    if (GetFileAttributesW(STEAM_KIOSK_HIVE) == INVALID_FILE_ATTRIBUTES)
+    if (GetFileAttributesW(STEAM_KIOSK_HIVE) == INVALID_FILE_ATTRIBUTES) {
+        debug_log(L"ERROR: Live hive not found: %s", STEAM_KIOSK_HIVE);
         return false;
+    }
 
     // Best effort: remove attributes that might block overwrite
     SetFileAttributesW(STEAM_KIOSK_HIVE, FILE_ATTRIBUTE_NORMAL);
 
-    return CopyFileW(
-        NTUSER_BACKUP_PATH,
-        STEAM_KIOSK_HIVE,
-        FALSE   // overwrite
-    ) != FALSE;
+    if (!CopyFileW(NTUSER_BACKUP_PATH, STEAM_KIOSK_HIVE, FALSE)) {
+        debug_log(L"ERROR: Failed to restore backup. LastError: %lu", GetLastError());
+        return false;
+    }
+
+    debug_log(L"SUCCESS: Profile restored from backup");
+    return true;
 }
 
 // ========================================
 // Privileges
 // ========================================
-inline bool system_privilege_enable(HANDLE h_token, LPCWSTR privilege, BOOL enable)
-{
+inline bool system_privilege_enable(HANDLE h_token, LPCWSTR privilege, BOOL enable) {
     TOKEN_PRIVILEGES tp{};
     LUID luid;
 
-    if (!LookupPrivilegeValueW(nullptr, privilege, &luid))
+    if (!LookupPrivilegeValueW(nullptr, privilege, &luid)) {
+        debug_log(L"ERROR: Failed to lookup privilege: %s", privilege);
         return false;
+    }
 
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Luid = luid;
     tp.Privileges[0].Attributes = enable ? SE_PRIVILEGE_ENABLED : 0;
 
-    return AdjustTokenPrivileges(h_token, FALSE, &tp, sizeof(tp), nullptr, nullptr) &&
-           GetLastError() == ERROR_SUCCESS;
+    if (!AdjustTokenPrivileges(h_token, FALSE, &tp, sizeof(tp), nullptr, nullptr)) {
+        debug_log(L"ERROR: Failed to adjust token privileges for: %s", privilege);
+        return false;
+    }
+
+    if (GetLastError() != ERROR_SUCCESS) {
+        debug_log(L"ERROR: Privilege adjustment error for: %s", privilege);
+        return false;
+    }
+
+    debug_log(L"INFO: %s privilege %s successfully", privilege, enable ? L"enabled" : L"disabled");
+    return true;
 }
 
 // ========================================
 // User Management
-// =======================================
-
-inline bool kiosk_user_exists()
-{
+// ========================================
+inline bool kiosk_user_exists() {
     USER_INFO_0* buf = nullptr;
     DWORD entries_read, total_entries;
     auto res = NetUserEnum(nullptr, 0, FILTER_NORMAL_ACCOUNT,
                            reinterpret_cast<LPBYTE*>(&buf), MAX_PREFERRED_LENGTH,
                            &entries_read, &total_entries, nullptr);
-    if (res != NERR_Success)
+    if (res != NERR_Success) {
+        debug_log(L"ERROR: Failed to enumerate users. Status: %lu", res);
         return false;
+    }
 
     for (DWORD i = 0; i < entries_read; i++) {
         if (_wcsicmp(buf[i].usri0_name, STEAM_KIOSK_USER) == 0) {
+            debug_log(L"INFO: Kiosk user already exists: %s", STEAM_KIOSK_USER);
             NetApiBufferFree(buf);
             return true;
         }
     }
 
-    if (buf)
+    if (buf) {
         NetApiBufferFree(buf);
+    }
 
+    debug_log(L"INFO: Kiosk user does not exist: %s", STEAM_KIOSK_USER);
     return false;
 }
 
-inline bool kiosk_user_create()
-{
+inline bool kiosk_user_create() {
     USER_INFO_1 ui{};
     DWORD dw_error = 0;
 
@@ -355,12 +465,21 @@ inline bool kiosk_user_create()
     ui.usri1_priv     = USER_PRIV_USER;
     ui.usri1_flags    = UF_SCRIPT | UF_DONT_EXPIRE_PASSWD;
 
-    return NetUserAdd(nullptr, 1, reinterpret_cast<LPBYTE>(&ui), &dw_error) == NERR_Success;
+    if (NetUserAdd(nullptr, 1, reinterpret_cast<LPBYTE>(&ui), &dw_error) == NERR_Success) {
+        debug_log(L"SUCCESS: Kiosk user created: %s", STEAM_KIOSK_USER);
+        return true;
+    }
+
+    debug_log(L"ERROR: Failed to create kiosk user. Status: %lu", dw_error);
+    return false;
 }
 
-inline void kiosk_user_destroy()
-{
-    NetUserDel(nullptr, STEAM_KIOSK_USER);
+inline void kiosk_user_destroy() {
+    if (NetUserDel(nullptr, STEAM_KIOSK_USER) == NERR_Success) {
+        debug_log(L"SUCCESS: Kiosk user deleted: %s", STEAM_KIOSK_USER);
+    } else {
+        debug_log(L"ERROR: Failed to delete kiosk user: %s", STEAM_KIOSK_USER);
+    }
 }
 
 // ========================================
@@ -372,34 +491,43 @@ inline int kiosk_profile_exists() {
     // 1 = profile missing (NTUSER.DAT not present)
     // 3 = profile present but hive could not be loaded (corrupt/unreadable)
 
-    if (GetFileAttributesW(STEAM_KIOSK_HIVE) == INVALID_FILE_ATTRIBUTES)
+    if (GetFileAttributesW(STEAM_KIOSK_HIVE) == INVALID_FILE_ATTRIBUTES) {
+        debug_log(L"INFO: Kiosk profile does not exist yet");
         return 1;
+    }
 
     // Try loading the hive via a temporary copy while holding the required
     // privileges. This avoids loading the live NTUSER.DAT directly which
     // can corrupt the user's profile if the system already has it loaded.
-    scoped_privileges privs{ SE_RESTORE_NAME, SE_BACKUP_NAME };
+    scoped_privileges privs { SE_RESTORE_NAME, SE_BACKUP_NAME };
     scoped_user_hive hive;
 
-    if (!hive.ok())
+    if (!hive.ok()) {
+        debug_log(L"ERROR: Kiosk profile is corrupted or unreadable. Cannot load hive.");
         return 3;
+    }
 
+    debug_log(L"SUCCESS: Kiosk profile exists and is readable");
     return 0;
 }
 
 // ========================================
 // Autologin
 // ========================================
-inline void autologin_enable()
-{
+inline void autologin_enable() {
+    debug_log(L"INFO: Enabling autologin");
+
     HKEY h_key;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                       L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
-                      0, KEY_SET_VALUE, &h_key) != ERROR_SUCCESS)
+                      0, KEY_SET_VALUE, &h_key) != ERROR_SUCCESS) {
+        debug_log(L"ERROR: Failed to open Winlogon registry key");
         return;
+    }
 
     RegSetValueExW(h_key, L"AutoAdminLogon", 0, REG_SZ,
-                   reinterpret_cast<const BYTE*>(L"1"), sizeof(L"1"));
+                   reinterpret_cast<const BYTE*>(L"1"),
+                   sizeof(L"1"));
     RegSetValueExW(h_key, L"DefaultUserName", 0, REG_SZ,
                    reinterpret_cast<const BYTE*>(STEAM_KIOSK_USER),
                    static_cast<DWORD>((wcslen(STEAM_KIOSK_USER) + 1) * sizeof(wchar_t)));
@@ -407,27 +535,33 @@ inline void autologin_enable()
                    reinterpret_cast<const BYTE*>(STEAM_KIOSK_PASS),
                    static_cast<DWORD>((wcslen(STEAM_KIOSK_PASS) + 1) * sizeof(wchar_t)));
     RegSetValueExW(h_key, L"DefaultDomainName", 0, REG_SZ,
-                   reinterpret_cast<const BYTE*>(L"."), sizeof(L"."));
+                   reinterpret_cast<const BYTE*>(L"."),
+                   sizeof(L"."));
 
+    RegFlushKey(h_key);
     RegCloseKey(h_key);
+    debug_log(L"SUCCESS: Autologin enabled");
 }
 
-inline void autologin_disable()
-{
+inline void autologin_disable() {
+    debug_log(L"INFO: Disabling autologin");
+
     HKEY h_key;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                       L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
-                      0, KEY_SET_VALUE, &h_key) == ERROR_SUCCESS)
-    {
+                      0, KEY_SET_VALUE, &h_key) == ERROR_SUCCESS) {
         RegSetValueExW(h_key, L"AutoAdminLogon", 0, REG_SZ,
-                       reinterpret_cast<const BYTE*>(L"0"), sizeof(L"0"));
+                       reinterpret_cast<const BYTE*>(L"0"),
+                       sizeof(L"0"));
         RegFlushKey(h_key);
         RegCloseKey(h_key);
+        debug_log(L"SUCCESS: Autologin disabled");
+    } else {
+        debug_log(L"ERROR: Failed to open Winlogon registry key");
     }
 }
 
-inline bool autologin_status()
-{
+inline bool autologin_status() {
     HKEY h_key;
     wchar_t buf[512]{};
     DWORD type;
@@ -441,8 +575,7 @@ inline bool autologin_status()
     size = sizeof(buf);
     if (RegQueryValueExW(h_key, L"AutoAdminLogon", nullptr, &type,
                          (BYTE*)buf, &size) != ERROR_SUCCESS ||
-        type != REG_SZ || wcscmp(buf, L"1") != 0)
-    {
+        type != REG_SZ || wcscmp(buf, L"1") != 0) {
         RegCloseKey(h_key);
         return false;
     }
@@ -450,8 +583,7 @@ inline bool autologin_status()
     size = sizeof(buf);
     if (RegQueryValueExW(h_key, L"DefaultUserName", nullptr, &type,
                          (BYTE*)buf, &size) != ERROR_SUCCESS ||
-        type != REG_SZ || wcscmp(buf, STEAM_KIOSK_USER) != 0)
-    {
+        type != REG_SZ || wcscmp(buf, STEAM_KIOSK_USER) != 0) {
         RegCloseKey(h_key);
         return false;
     }
@@ -463,114 +595,111 @@ inline bool autologin_status()
 // ========================================
 // Other Users Prompt
 // ========================================
-bool _users_prompt(bool enable)
-{
+bool users_prompt_helper(bool enable) {
+    debug_log(L"INFO: %s users prompt", enable ? L"Enabling" : L"Disabling");
+
     HKEY h_key;
     DWORD value = enable ? 1 : 0;
 
-    if (RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-            0,
-            KEY_SET_VALUE,
-            &h_key) != ERROR_SUCCESS)
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                      0, KEY_SET_VALUE, &h_key) != ERROR_SUCCESS) {
+        debug_log(L"ERROR: Failed to open Policies registry key");
         return false;
+    }
 
-    LONG rc = RegSetValueExW(
-        h_key,
-        L"dontdisplaylastusername",
-        0,
-        REG_DWORD,
-        reinterpret_cast<const BYTE*>(&value),
-        sizeof(value));
+    LONG rc = RegSetValueExW(h_key, L"dontdisplaylastusername", 0, REG_DWORD,
+                             reinterpret_cast<const BYTE*>(&value), sizeof(value));
 
     RegFlushKey(h_key);
     RegCloseKey(h_key);
 
+    if (rc == ERROR_SUCCESS) {
+        debug_log(L"SUCCESS: Users prompt %s", enable ? L"enabled" : L"disabled");
+    } else {
+        debug_log(L"ERROR: Failed to set users prompt. Status: %lu", rc);
+    }
+
     return rc == ERROR_SUCCESS;
 }
 
-inline bool users_prompt_status()
-{
+inline bool users_prompt_status() {
     HKEY h_key;
     DWORD value = 0;
-    DWORD size  = sizeof(value);
-    DWORD type  = 0;
+    DWORD size = sizeof(value);
+    DWORD type = 0;
 
-    if (RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-            0,
-            KEY_QUERY_VALUE,
-            &h_key) != ERROR_SUCCESS)
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                      0, KEY_QUERY_VALUE, &h_key) != ERROR_SUCCESS)
         return false;
 
-    LONG rc = RegQueryValueExW(
-        h_key,
-        L"dontdisplaylastusername",
-        nullptr,
-        &type,
-        reinterpret_cast<BYTE*>(&value),
-        &size);
+    LONG rc = RegQueryValueExW(h_key, L"dontdisplaylastusername", nullptr, &type,
+                               reinterpret_cast<BYTE*>(&value), &size);
 
     RegCloseKey(h_key);
 
-    return rc == ERROR_SUCCESS &&
-           type == REG_DWORD &&
-           value == 1;
+    return rc == ERROR_SUCCESS && type == REG_DWORD && value == 1;
 }
 
-inline void users_prompt_enable()
-{
-    _users_prompt(true);
+inline void users_prompt_enable() {
+    users_prompt_helper(true);
 }
 
-inline void users_prompt_disable()
-{
-    _users_prompt(false);
+inline void users_prompt_disable() {
+    users_prompt_helper(false);
 }
 
 // ========================================
 // Kiosk Shell
 // ========================================
-inline bool kiosk_set_shell(LPCWSTR shell_cmd)
-{
-    scoped_privileges privs{ SE_BACKUP_NAME, SE_RESTORE_NAME };
+inline bool kiosk_set_shell(LPCWSTR shell_cmd) {
+    debug_log(L"INFO: Setting kiosk shell to: %s", shell_cmd);
+
+    scoped_privileges privs { SE_BACKUP_NAME, SE_RESTORE_NAME };
     scoped_user_hive hive;
 
-    if (!hive.ok())
+    if (!hive.ok()) {
+        debug_log(L"ERROR: Cannot access user hive to set shell");
         return false;
+    }
 
     HKEY key;
-    LONG rc = RegOpenKeyExW(
-        HKEY_USERS,
-        L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
-        0, KEY_SET_VALUE, &key);
+    LONG rc = RegOpenKeyExW(HKEY_USERS,
+                            L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+                            0, KEY_SET_VALUE, &key);
 
-    if (rc != ERROR_SUCCESS)
+    if (rc != ERROR_SUCCESS) {
+        debug_log(L"ERROR: Failed to open shell registry key. Status: %lu", rc);
         return false;
+    }
 
-    RegSetValueExW(key, L"Shell", 0, REG_SZ,
-        reinterpret_cast<const BYTE*>(shell_cmd),
-        static_cast<DWORD>((wcslen(shell_cmd) + 1) * sizeof(wchar_t)));
+    rc = RegSetValueExW(key, L"Shell", 0, REG_SZ,
+                        reinterpret_cast<const BYTE*>(shell_cmd),
+                        static_cast<DWORD>((wcslen(shell_cmd) + 1) * sizeof(wchar_t)));
 
     RegFlushKey(key);
     RegCloseKey(key);
-    return true;
+
+    if (rc == ERROR_SUCCESS) {
+        debug_log(L"SUCCESS: Shell set successfully");
+    } else {
+        debug_log(L"ERROR: Failed to set shell. Status: %lu", rc);
+    }
+
+    return rc == ERROR_SUCCESS;
 }
-inline void kiosk_shell_bigpicture()
-{
+
+inline void kiosk_shell_bigpicture() {
     kiosk_set_shell(BIG_PICTURE_EXEC);
 }
 
-inline void kiosk_shell_explorer()
-{
+inline void kiosk_shell_explorer() {
     kiosk_set_shell(L"explorer.exe");
 }
 
-inline bool kiosk_shell_status()
-{
-    scoped_privileges privs{ SE_BACKUP_NAME };
+inline bool kiosk_shell_status() {
+    scoped_privileges privs { SE_BACKUP_NAME };
     scoped_user_hive hive;
 
     if (!hive.ok())
@@ -579,91 +708,103 @@ inline bool kiosk_shell_status()
     wchar_t shell[512]{};
     DWORD size = sizeof(shell);
 
-    LONG rc = RegGetValueW(
-        HKEY_USERS,
-        L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
-        L"Shell",
-        RRF_RT_REG_SZ, nullptr, shell, &size);
+    LONG rc = RegGetValueW(HKEY_USERS,
+                           L"STEAM_KIOSK\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+                           L"Shell", RRF_RT_REG_SZ, nullptr, shell, &size);
 
     return rc == ERROR_SUCCESS && wcscmp(shell, BIG_PICTURE_EXEC) == 0;
 }
 
 // ========================================
-// Session helpers
+// Session Helpers
 // ========================================
-inline void logoff_user()  {
+inline void logoff_user() {
+    debug_log(L"INFO: Initiating user logoff");
     ExitWindowsEx(EWX_LOGOFF | EWX_FORCE, 0);
 }
 
-inline void     restart_user() { ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0); }
+inline void restart_user() {
+    debug_log(L"INFO: Initiating system restart");
+    ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0);
+}
 
 // ========================================
 // UI Helpers
 // ========================================
-inline void update_ui()
-{
-    SendMessageW(h_autologin, BM_SETCHECK,
+inline void update_ui() {
+    SendMessageW(g_hwnd_autologin, BM_SETCHECK,
                  autologin_status() ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(h_shell, BM_SETCHECK,
+    SendMessageW(g_hwnd_shell, BM_SETCHECK,
                  kiosk_shell_status() ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
-inline void prompt_first_login()
-{
+inline void prompt_first_login() {
     wchar_t msg[512];
     swprintf_s(msg, L"Kiosk user created:\n\n"
-                    L"Username: `%s`\n"
-                    L"Password: `%s`\n\n"
+                    L"Username: %s\n"
+                    L"Password: %s\n\n"
                     L"After closing this message box, the login screen will appear.\n"
-                    L"Login using the details provided above and wait for initialisation to completex`.\n"
+                    L"Login using the details provided above and wait for initialisation to complete.\n"
                     L"Then logout, and log back into your personal user account to return to this helper.",
-            STEAM_KIOSK_USER, STEAM_KIOSK_PASS);
+                STEAM_KIOSK_USER, STEAM_KIOSK_PASS);
 
+    debug_log(L"INFO: Displaying first login prompt");
     MessageBoxW(nullptr, msg, L"Steam Kiosk Setup", MB_OK | MB_ICONINFORMATION);
 }
 
-inline bool prompt_corrupt_profile()
-{
+inline bool prompt_corrupt_profile() {
     wchar_t msg[256];
-    swprintf_s(msg, L"NTUSER.DAT for `%s` is corrupted and unreadable!\n\n"
+    swprintf_s(msg, L"NTUSER.DAT for %s is corrupted and unreadable!\n\n"
                     L"Certain functionality may not work correctly.\n"
                     L"Please destroy the user profile and attempt running again.\n\n"
                     L"Attempt to restore from backup?",
-              STEAM_KIOSK_USER);
+                    STEAM_KIOSK_USER);
 
+    debug_log(L"ERROR: Displaying corrupt profile prompt");
     int result = MessageBoxW(nullptr, msg, L"Steam Kiosk Setup",
                              MB_YESNO | MB_ICONERROR);
 
-    return result == IDYES; // true if user clicked Yes, false if No
+    return result == IDYES;  // true if user clicked Yes, false if No
 }
 
-inline void switch_to_other_user_screen()
-{
+inline void switch_to_other_user_screen() {
+    debug_log(L"INFO: Switching to other user screen");
     autologin_disable();
-    WTSDisconnectSession(WTS_CURRENT_SERVER_HANDLE,
-                         WTS_CURRENT_SESSION, FALSE);
+    WTSDisconnectSession(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, FALSE);
 }
 
-// ======================================== 
+// ========================================
 // Delete User Profile
 // ========================================
-inline bool delete_kiosk_user_profile()
-{
+inline bool delete_kiosk_user_profile() {
+    debug_log(L"INFO: Deleting kiosk user profile: %s", STEAM_KIOSK_PROFILE_DIR);
+
     DWORD attrs = GetFileAttributesW(STEAM_KIOSK_PROFILE_DIR);
 
     // Nothing to do
-    if (attrs == INVALID_FILE_ATTRIBUTES)
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        debug_log(L"INFO: Profile directory does not exist");
         return true;
+    }
 
     // Must be a directory
-    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY))
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        debug_log(L"ERROR: Profile path is not a directory");
         return false;
+    }
 
-    return delete_directory_recursive(STEAM_KIOSK_PROFILE_DIR);
+    if (delete_directory_recursive(STEAM_KIOSK_PROFILE_DIR)) {
+        debug_log(L"SUCCESS: Profile directory deleted");
+        return true;
+    }
+
+    debug_log(L"ERROR: Failed to delete profile directory");
+    return false;
 }
 
-inline bool destroy_kiosk_user_completely()
-{
+inline bool destroy_kiosk_user_completely() {
+    debug_log(L"INFO: Starting complete kiosk user destruction");
+
     // 1. Disable autologin first
     autologin_disable();
 
@@ -674,12 +815,15 @@ inline bool destroy_kiosk_user_completely()
     Sleep(500);
 
     // 3. Delete profile directory (NTUSER.DAT must not be loaded)
-    if (!delete_kiosk_user_profile())
+    if (!delete_kiosk_user_profile()) {
+        debug_log(L"ERROR: Failed to delete profile directory during destruction");
         return false;
+    }
 
     // 4. Delete the user account
     kiosk_user_destroy();
 
+    debug_log(L"SUCCESS: Complete kiosk user destruction finished");
     return true;
 }
 
