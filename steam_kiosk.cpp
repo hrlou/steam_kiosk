@@ -28,9 +28,43 @@ inline constexpr auto STEAM_KIOSK_HIVE       = L"C:\\Users\\steam_kiosk\\NTUSER.
 
 inline constexpr int MAIN_WINDOW_WIDTH       = 400;
 inline constexpr int MAIN_WINDOW_HEIGHT      = 300;
-inline constexpr int TOGGLE_WIDTH            = 112;  // ((400−(20×2))−(12×2))×1/3
-inline constexpr int BUTTON_WIDTH            = 150;
-inline constexpr int BUTTON_HEIGHT           = 40;
+
+// Geometric layout constants - all calculated as percentages/ratios of window size
+inline constexpr int MARGIN_H                = MAIN_WINDOW_WIDTH / 20;      // 5% of width
+inline constexpr int MARGIN_V                = MAIN_WINDOW_HEIGHT / 30;     // 3.3% of height
+inline constexpr int SPACING                 = MAIN_WINDOW_WIDTH / 33;      // ~3% of width (12px)
+inline constexpr int SECTION_GAP             = MAIN_WINDOW_HEIGHT / 15;     // 6.7% of height (20px)
+
+// Title dimensions
+inline constexpr int TITLE_H                 = MAIN_WINDOW_HEIGHT / 10;     // 10% of height
+inline constexpr int TITLE_Y                 = MARGIN_V;
+
+// Checkbox row
+inline constexpr int NUM_CHECKBOXES          = 3;
+inline constexpr int CHECKBOX_H              = MAIN_WINDOW_HEIGHT / 7.5;    // ~40px
+inline constexpr int CHECKBOX_Y              = TITLE_Y + TITLE_H + SECTION_GAP;
+inline constexpr int CHECKBOX_TOTAL_WIDTH    = MAIN_WINDOW_WIDTH - (2 * MARGIN_H);
+inline constexpr int CHECKBOX_WIDTH          = (CHECKBOX_TOTAL_WIDTH - (2 * SPACING)) / 3;
+inline constexpr int CHECKBOX1_X             = MARGIN_H;
+inline constexpr int CHECKBOX2_X             = CHECKBOX1_X + CHECKBOX_WIDTH + SPACING;
+inline constexpr int CHECKBOX3_X             = CHECKBOX2_X + CHECKBOX_WIDTH + SPACING;
+
+// Button row
+inline constexpr int NUM_BUTTONS             = 2;
+inline constexpr int BUTTON_H                = MAIN_WINDOW_HEIGHT / 7.5;    // ~40px
+inline constexpr int BUTTON_Y                = CHECKBOX_Y + CHECKBOX_H + SECTION_GAP;
+inline constexpr int BUTTON_TOTAL_WIDTH      = MAIN_WINDOW_WIDTH - (2 * MARGIN_H);
+inline constexpr int BUTTON_WIDTH            = (BUTTON_TOTAL_WIDTH - SECTION_GAP) / 2;
+inline constexpr int BUTTON1_X               = MARGIN_H;
+inline constexpr int BUTTON2_X               = BUTTON1_X + BUTTON_WIDTH + SECTION_GAP;
+
+// Delete button - centered
+inline constexpr int DELETE_Y                = BUTTON_Y + BUTTON_H + SECTION_GAP;
+inline constexpr int DELETE_X                = (MAIN_WINDOW_WIDTH - BUTTON_WIDTH) / 2;
+
+// Legacy constants for compatibility
+inline constexpr int TOGGLE_WIDTH            = CHECKBOX_WIDTH;
+inline constexpr int BUTTON_HEIGHT           = BUTTON_H;
 inline constexpr int FONT_SIZE               = 16;
 inline constexpr int HIVE_VALIDATION_SIZE    = 4096;  // Minimum valid hive size
 
@@ -1228,6 +1262,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         update_ui();
         break;
 
+    case WM_CTLCOLORDLG:
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wParam;
+        SetBkColor(hdc, RGB(35, 35, 35));       // Dark background
+        SetTextColor(hdc, RGB(235, 235, 235));  // Light text
+        static HBRUSH hbrush = CreateSolidBrush(RGB(35, 35, 35));
+        return (LRESULT)hbrush;
+    }
+
+    case WM_CTLCOLORBTN: {
+        HDC hdc = (HDC)wParam;
+        SetBkColor(hdc, RGB(35, 35, 35));       // Dark background
+        SetTextColor(hdc, RGB(235, 235, 235));  // Light text
+        static HBRUSH hbrush = CreateSolidBrush(RGB(50, 50, 50));  // Slightly lighter for buttons
+        return (LRESULT)hbrush;
+    }
+
     case WM_DESTROY:
         PostQuitMessage(0);
         break;
@@ -1330,10 +1381,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
     wc.lpszClassName = L"SteamKioskHelper";
+    wc.hbrBackground = CreateSolidBrush(RGB(240, 240, 240));  // Light gray background
+    wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
 
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"Steam Kiosk Helper",
-                              WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+                              WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                               CW_USEDEFAULT, CW_USEDEFAULT,
                               MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT,
                               nullptr, nullptr, hInst, nullptr);
@@ -1341,57 +1394,60 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     // Title
     g_hwnd_title = CreateWindowW(L"STATIC", L"Steam Kiosk Helper",
                                  WS_CHILD | WS_VISIBLE | SS_CENTER,
-                                 0, 10, MAIN_WINDOW_WIDTH, 30,
+                                 0, TITLE_Y, MAIN_WINDOW_WIDTH, TITLE_H,
                                  hwnd, nullptr, hInst, nullptr);
 
     HFONT h_font = CreateFontW(FONT_SIZE, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+    
+    HFONT h_small_font = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                     CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
 
     SendMessageW(g_hwnd_title, WM_SETFONT, (WPARAM)h_font, TRUE);
 
-    // Buttons / Checkboxes 2x2 grid
-    // 20+112+12+112+12+112+20 
-    // ((400−(20×2))−(12×2))×1/3
+    // Checkboxes - properly aligned and spaced
     g_hwnd_autologin = CreateWindowW(L"BUTTON", L"Autologin",
                                      WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                     20, 60, TOGGLE_WIDTH, BUTTON_HEIGHT,
+                                     CHECKBOX1_X, CHECKBOX_Y, TOGGLE_WIDTH, CHECKBOX_H,
                                      hwnd, nullptr, hInst, nullptr);
 
     g_hwnd_shell = CreateWindowW(L"BUTTON", L"Big-Picture Shell",
                                  WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                 144, 60, TOGGLE_WIDTH, BUTTON_HEIGHT,
+                                 CHECKBOX2_X, CHECKBOX_Y, TOGGLE_WIDTH, CHECKBOX_H,
                                  hwnd, nullptr, hInst, nullptr);
 
     g_hwnd_users_prompt = CreateWindowW(L"BUTTON", L"User Prompt",
                                         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                        268, 60, TOGGLE_WIDTH, BUTTON_HEIGHT,
+                                        CHECKBOX3_X, CHECKBOX_Y, TOGGLE_WIDTH, CHECKBOX_H,
                                         hwnd, nullptr, hInst, nullptr);
 
+    // Action buttons - properly aligned and spaced
     g_hwnd_logoff = CreateWindowW(L"BUTTON", L"Log Off",
                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                  50, 120, BUTTON_WIDTH, BUTTON_HEIGHT,
+                                  BUTTON1_X, BUTTON_Y, BUTTON_WIDTH, BUTTON_H,
                                   hwnd, nullptr, hInst, nullptr);
 
     g_hwnd_restart = CreateWindowW(L"BUTTON", L"Restart",
                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                   220, 120, BUTTON_WIDTH, BUTTON_HEIGHT,
+                                   BUTTON2_X, BUTTON_Y, BUTTON_WIDTH, BUTTON_H,
                                    hwnd, nullptr, hInst, nullptr);
 
-    // Delete User button (bottom middle)
+    // Delete User button - centered
     g_hwnd_delete_user = CreateWindowW(L"BUTTON", L"Delete User",
                                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                       (MAIN_WINDOW_WIDTH - BUTTON_WIDTH) / 2,
-                                       180,
-                                       BUTTON_WIDTH, BUTTON_HEIGHT,
+                                       DELETE_X, DELETE_Y,
+                                       BUTTON_WIDTH, BUTTON_H,
                                        hwnd, nullptr, hInst, nullptr);
 
-    SendMessageW(g_hwnd_autologin, WM_SETFONT, (WPARAM)h_font, TRUE);
-    SendMessageW(g_hwnd_shell, WM_SETFONT, (WPARAM)h_font, TRUE);
-    SendMessageW(g_hwnd_users_prompt, WM_SETFONT, (WPARAM)h_font, TRUE);
-    SendMessageW(g_hwnd_logoff, WM_SETFONT, (WPARAM)h_font, TRUE);
-    SendMessageW(g_hwnd_restart, WM_SETFONT, (WPARAM)h_font, TRUE);
-    SendMessageW(g_hwnd_delete_user, WM_SETFONT, (WPARAM)h_font, TRUE);
+    // Apply fonts
+    SendMessageW(g_hwnd_autologin, WM_SETFONT, (WPARAM)h_small_font, TRUE);
+    SendMessageW(g_hwnd_shell, WM_SETFONT, (WPARAM)h_small_font, TRUE);
+    SendMessageW(g_hwnd_users_prompt, WM_SETFONT, (WPARAM)h_small_font, TRUE);
+    SendMessageW(g_hwnd_logoff, WM_SETFONT, (WPARAM)h_small_font, TRUE);
+    SendMessageW(g_hwnd_restart, WM_SETFONT, (WPARAM)h_small_font, TRUE);
+    SendMessageW(g_hwnd_delete_user, WM_SETFONT, (WPARAM)h_small_font, TRUE);
 
     ShowWindow(hwnd, SW_SHOW);
     update_ui();
