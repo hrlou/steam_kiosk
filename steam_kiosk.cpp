@@ -11,36 +11,39 @@
 #include <wtsapi32.h>
 #include <shellapi.h>
 #include <thread>
+#include <ctime>
 
 // ========================================
 // Constants
 // ========================================
-inline constexpr auto LOCAL_PATH        = L"C:\\tools\\steam_shell\\local";
-inline constexpr auto NTUSER_BACKUP_PATH = L"C:\\tools\\steam_shell\\local\\NTUSER_BACKUP.DAT";
-inline constexpr auto STEAM_EXE_PATH    = L"C:\\Program Files (x86)\\Steam\\steam.exe";
-inline constexpr auto BIG_PICTURE_EXEC  = L"C:\\Program Files (x86)\\Steam\\steam.exe -bigpicture";
-inline constexpr auto STEAM_KIOSK_USER  = L"steam_kiosk";
-inline constexpr auto STEAM_KIOSK_PASS  = L"valve";
+inline constexpr auto LOCAL_PATH             = L"C:\\tools\\steam_shell\\local";
+inline constexpr auto NTUSER_BACKUP_PATH     = L"C:\\tools\\steam_shell\\local\\NTUSER_BACKUP.DAT";
+inline constexpr auto DEBUG_LOG_PATH         = L"C:\\tools\\steam_shell\\local\\debug.log";
+inline constexpr auto STEAM_EXE_PATH         = L"C:\\Program Files (x86)\\Steam\\steam.exe";
+inline constexpr auto BIG_PICTURE_EXEC       = L"C:\\Program Files (x86)\\Steam\\steam.exe -bigpicture";
+inline constexpr auto STEAM_KIOSK_USER       = L"steam_kiosk";
+inline constexpr auto STEAM_KIOSK_PASS       = L"valve";
 inline constexpr auto STEAM_KIOSK_PROFILE_DIR = L"C:\\Users\\steam_kiosk";
-inline constexpr auto STEAM_KIOSK_HIVE  = L"C:\\Users\\steam_kiosk\\NTUSER.DAT";
+inline constexpr auto STEAM_KIOSK_HIVE       = L"C:\\Users\\steam_kiosk\\NTUSER.DAT";
 
-inline constexpr int MAIN_WINDOW_WIDTH  = 400;
-inline constexpr int MAIN_WINDOW_HEIGHT = 300;
-inline constexpr int TOGGLE_WIDTH       = 112; // ((400−(20×2))−(12×2))×1/3
-inline constexpr int BUTTON_WIDTH       = 150;
-inline constexpr int BUTTON_HEIGHT      = 40;
-inline constexpr int FONT_SIZE          = 16;
+inline constexpr int MAIN_WINDOW_WIDTH       = 400;
+inline constexpr int MAIN_WINDOW_HEIGHT      = 300;
+inline constexpr int TOGGLE_WIDTH            = 112;  // ((400−(20×2))−(12×2))×1/3
+inline constexpr int BUTTON_WIDTH            = 150;
+inline constexpr int BUTTON_HEIGHT           = 40;
+inline constexpr int FONT_SIZE               = 16;
+inline constexpr int HIVE_VALIDATION_SIZE    = 4096;  // Minimum valid hive size
 
 // ========================================
 // Global Window Handles
 // ========================================
-HWND h_title;
-HWND h_autologin;
-HWND h_shell;
-HWND h_users_prompt;
-HWND h_logoff;
-HWND h_restart;
-HWND h_delete_user;
+HWND g_hwnd_title;
+HWND g_hwnd_autologin;
+HWND g_hwnd_shell;
+HWND g_hwnd_users_prompt;
+HWND g_hwnd_logoff;
+HWND g_hwnd_restart;
+HWND g_hwnd_delete_user;
 
 // ========================================
 // Forward declarations
@@ -49,6 +52,42 @@ void update_ui();
 void prompt_first_login();
 void switch_to_other_user_screen();
 void kiosk_setup_if_needed();
+
+// ========================================
+// Debug Logging
+// ========================================
+inline void ensure_local_path() {
+    CreateDirectoryW(LOCAL_PATH, nullptr);
+}
+
+inline void debug_log(const wchar_t* format, ...) {
+    ensure_local_path();
+
+    FILE* file = nullptr;
+    _wfopen_s(&file, DEBUG_LOG_PATH, L"a");
+    if (!file) {
+        return;
+    }
+
+    // Get current timestamp
+    time_t now = time(nullptr);
+    struct tm timeinfo {};
+    localtime_s(&timeinfo, &now);
+
+    wchar_t timestamp[32] = {};
+    wcsftime(timestamp, sizeof(timestamp) / sizeof(wchar_t), L"%Y-%m-%d %H:%M:%S", &timeinfo);
+
+    fwprintf(file, L"[%s] ", timestamp);
+
+    va_list args;
+    va_start(args, format);
+    vfwprintf(file, format, args);
+    va_end(args);
+
+    fwprintf(file, L"\n");
+    fflush(file);
+    fclose(file);
+}
 
 struct scoped_privileges {
     HANDLE token = nullptr;
@@ -90,10 +129,21 @@ struct scoped_user_hive {
     bool loaded = false;
 
     scoped_user_hive() {
-        swprintf_s(temp_hive, L"C:\\tools\\steam_shell\\local\\NTUSER_TEMP.DAT");
+        // Ensure the local working directory exists and create a unique temp file
+        ensure_local_path();
 
-        if (!CopyFileW(STEAM_KIOSK_HIVE, temp_hive, FALSE))
+        // Create a unique temp name in the repo-local `local` directory to avoid
+        // collisions with other runs/processes. GetTempFileNameW will create the
+        // file — we'll overwrite it with a copy of the hive.
+        if (GetTempFileNameW(LOCAL_PATH, L"KHI", 0, temp_hive) == 0)
             return;
+
+        // Copy the live hive into the temp location. Overwrite any existing temp.
+        if (!CopyFileW(STEAM_KIOSK_HIVE, temp_hive, FALSE)) {
+            // remove the temp file created by GetTempFileNameW
+            DeleteFileW(temp_hive);
+            return;
+        }
 
         if (RegLoadKeyW(HKEY_USERS, hive_name, temp_hive) == ERROR_SUCCESS)
             loaded = true;
@@ -112,10 +162,6 @@ struct scoped_user_hive {
 // ========================================
 // Misc Helpers
 // ========================================
-inline void ensure_local_path()
-{
-    CreateDirectoryW(LOCAL_PATH, nullptr);
-}
 
 inline bool delete_directory_recursive(const wchar_t* path)
 {
@@ -321,14 +367,23 @@ inline void kiosk_user_destroy()
 // Kiosk Profile
 // ========================================
 inline int kiosk_profile_exists() {
-    const wchar_t* hive_name = L"STEAM_KIOSK";
-    wchar_t user_hive[MAX_PATH]{};
-    wcscpy_s(user_hive, STEAM_KIOSK_HIVE);
+    // Return codes:
+    // 0 = profile exists and hive is readable
+    // 1 = profile missing (NTUSER.DAT not present)
+    // 3 = profile present but hive could not be loaded (corrupt/unreadable)
 
-    if (GetFileAttributesW(user_hive) == INVALID_FILE_ATTRIBUTES)  
+    if (GetFileAttributesW(STEAM_KIOSK_HIVE) == INVALID_FILE_ATTRIBUTES)
         return 1;
-    if (RegLoadKeyW(HKEY_USERS, hive_name, user_hive) != ERROR_SUCCESS)
+
+    // Try loading the hive via a temporary copy while holding the required
+    // privileges. This avoids loading the live NTUSER.DAT directly which
+    // can corrupt the user's profile if the system already has it loaded.
+    scoped_privileges privs{ SE_RESTORE_NAME, SE_BACKUP_NAME };
+    scoped_user_hive hive;
+
+    if (!hive.ok())
         return 3;
+
     return 0;
 }
 
@@ -637,8 +692,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_COMMAND:
         if ((HWND)lParam == h_autologin)
             autologin_status() ? autologin_disable() : autologin_enable();
-        // else if ((HWND)lParam == h_shell)
-            // kiosk_shell_status() ? kiosk_shell_explorer() : kiosk_shell_bigpicture();
+        else if ((HWND)lParam == h_shell)
+            kiosk_shell_status() ? kiosk_shell_explorer() : kiosk_shell_bigpicture();
         else if ((HWND)lParam == h_users_prompt)
             users_prompt_status() ? users_prompt_disable() : users_prompt_enable();
         else if ((HWND)lParam == h_logoff)
