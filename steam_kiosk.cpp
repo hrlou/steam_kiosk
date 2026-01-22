@@ -173,7 +173,7 @@ inline bool is_running_as_steam_kiosk() {
     }
     
     bool is_kiosk = (wcscmp(username, STEAM_KIOSK_USER) == 0);
-    debug_log(L"INFO: Current user detected: %s (Is steam_kiosk: %d)", username, is_kiosk ? 1 : 0);
+    debug_log(L"INFO: Current user detected: %s (steam_kiosk: %s)", username, is_kiosk ? "true" : "false");
     return is_kiosk;
 }
 
@@ -625,6 +625,9 @@ inline bool system_privilege_enable(HANDLE h_token, LPCWSTR privilege, BOOL enab
 // User Management
 // ========================================
 inline bool kiosk_user_exists() {
+    if (is_running_as_steam_kiosk()) {
+        return true;
+    }
     USER_INFO_0* buf = nullptr;
     DWORD entries_read, total_entries;
     auto res = NetUserEnum(nullptr, 0, FILTER_NORMAL_ACCOUNT,
@@ -680,12 +683,17 @@ inline void kiosk_user_destroy() {
 // ========================================
 // Kiosk Profile
 // ========================================
+// rename status
 inline int kiosk_profile_exists() {
     // Return codes:
     // 0 = profile exists and hive is readable
     // 1 = profile missing (NTUSER.DAT not present)
+    // 2 = running as kiosk
     // 3 = profile present but hive could not be loaded (corrupt/unreadable)
 
+    if (is_running_as_steam_kiosk()) {
+        return 2;
+    }
     if (GetFileAttributesW(STEAM_KIOSK_HIVE) == INVALID_FILE_ATTRIBUTES) {
         debug_log(L"INFO: Kiosk profile does not exist yet");
         return 1;
