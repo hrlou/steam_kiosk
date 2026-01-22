@@ -1273,9 +1273,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_CTLCOLORBTN: {
         HDC hdc = (HDC)wParam;
-        SetBkColor(hdc, RGB(35, 35, 35));       // Dark background
+        SetBkColor(hdc, RGB(35, 60, 120));      // Dark blue background
         SetTextColor(hdc, RGB(235, 235, 235));  // Light text
-        static HBRUSH hbrush = CreateSolidBrush(RGB(50, 50, 50));  // Slightly lighter for buttons
+        static HBRUSH hbrush = CreateSolidBrush(RGB(35, 60, 120));  // Dark blue
         return (LRESULT)hbrush;
     }
 
@@ -1324,6 +1324,8 @@ void kiosk_setup_if_needed() {
             MessageBoxW(nullptr, L"Failed to create profile backup.",
                         L"Backup Failed", MB_OK | MB_ICONERROR);
         }
+    } else if (profile_status == 2) {
+        debug_log(L"INFO: Currently running under kiosk user");
     } else if (profile_status == 3) {
         debug_log(L"ERROR: Profile is corrupted, prompting user for restore");
         if (prompt_corrupt_profile()) {
@@ -1381,7 +1383,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
     wc.lpszClassName = L"SteamKioskHelper";
-    wc.hbrBackground = CreateSolidBrush(RGB(240, 240, 240));  // Light gray background
+    wc.hbrBackground = CreateSolidBrush(RGB(35, 35, 35));  // Dark background
     wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
 
